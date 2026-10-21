@@ -183,7 +183,7 @@ python tools/run_examples.py --update   # regenera los resultados
 ## Pruebas
 
 ```bash
-python -m pytest            # 78 pruebas: léxico, sintaxis, semántica, REPL, CLI y ejemplos
+python -m pytest            # 82 pruebas: léxico, sintaxis, semántica, REPL, CLI, ejemplos y PDF
 ```
 
 ## El documento de diseño
