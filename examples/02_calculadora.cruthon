@@ -1,0 +1,60 @@
+# Ejemplo 2 del documento de diseño: calculadora web con historial.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF llama a `render(...)` sin definirla: se declara dentro de
+#        `frontend`, el blob que la usa.
+#   [M2] El PDF define `calcular(a, b)` pero no la llama: aquí se invoca.
+#   [M3] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+#
+# `math` viene de la librería estándar de Python y se usa tal cual: dentro
+# de `backend` es invisible para `frontend`.
+
+blob main:
+    blob backend:
+        import math
+
+        func sumar(a, b):
+            return a + b
+
+        func potencia(base, exp):
+            return math.pow(base, exp)
+
+blob frontend:
+    # [M1] render no está definido en el PDF
+    func render(plantilla, operaciones):
+        print("[render]", plantilla, operaciones)
+
+    func dibujar_calculadora(historial):
+        render("calc.html", historial.operaciones)
+
+    func click_operacion(indice, historial):
+        return historial.operaciones[indice]
+
+blob historial = frontend & backend:
+    operaciones = []
+
+    func guardar(expresion, resultado):
+        operaciones.append((expresion, resultado))
+
+    func seleccionar(indice):
+        return operaciones[indice]
+
+func calcular(a, b):
+    r = backend.sumar(a, b)
+    historial.guardar(f"{a} + {b}", r)
+    frontend.dibujar_calculadora(historial)
+    return r
+
+# [M2] el PDF define `calcular` pero nunca la llama
+resultado = calcular(2, 3)
+print("calcular(2, 3) =", resultado)
+print("backend.potencia(2, 10) =", backend.potencia(2, 10))
+print("historial.operaciones =", historial.operaciones)
+print("historial.seleccionar(0) =", historial.seleccionar(0))
+# El frontend nunca ve `math`: lo que vive dentro de `backend` es
+# inalcanzable desde `frontend` (error de alcance por conjuntos).
+try:
+    print("frontend ve math =", frontend.math)
+except ScopeError as error:
+    print("frontend NO ve math ->", error)

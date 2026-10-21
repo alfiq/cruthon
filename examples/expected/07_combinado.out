@@ -1,0 +1,7 @@
+[log] pro inicio_sesion
+sistema.iniciar_app('ana', 'pro') = ['exportar_csv', 'soporte_email']
+base_comun.funciones_garantizadas() = ['exportar_csv', 'soporte_email']
+beneficios_pro.mostrar_upsell() = ['soporte_24h', 'api_acceso']
+distincion.resaltar_diferencias() = ['soporte_24h', 'api_acceso']
+base_comun ve exportar_csv = True
+base_comun NO ve soporte_24h -> el blob 'base_comun' no expone el miembro 'soporte_24h': no vive dentro de su área (error de alcance por conjuntos)

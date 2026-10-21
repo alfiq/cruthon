@@ -1,0 +1,34 @@
+# Ejemplo 3 del documento de diseño: intersección (&), memoria compartida.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF llama a `generar_token(usuario)` sin definirla: se declara
+#        dentro de `sesion`, el blob que la usa.
+#   [M2] El PDF define `iniciar(usuario)` pero no la llama: aquí se invoca.
+#   [M3] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+
+blob main:
+    blob frontend:
+        tema = "oscuro"
+
+    blob backend:
+        usuario_activo = "ana"
+
+    blob sesion = frontend & backend:
+        token = None
+
+        # [M1] generar_token no está definido en el PDF
+        func generar_token(usuario):
+            return "token-" + usuario
+
+        func iniciar(usuario):
+            token = generar_token(usuario)
+
+# [M2] el PDF define `iniciar` pero nunca la llama
+sesion.iniciar("ana")
+
+# [M3] resultados observables
+print("sesion.token =", sesion.token)
+# La intersección es la zona compartida: frontend y backend ven el mismo token.
+print("frontend ve el token compartido =", frontend.token)
+print("backend ve el token compartido =", backend.token)

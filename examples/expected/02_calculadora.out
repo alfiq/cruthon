@@ -1,0 +1,6 @@
+[render] calc.html [('2 + 3', 5)]
+calcular(2, 3) = 5
+backend.potencia(2, 10) = 1024.0
+historial.operaciones = [('2 + 3', 5)]
+historial.seleccionar(0) = ('2 + 3', 5)
+frontend NO ve math -> el blob 'frontend' no expone el miembro 'math': no vive dentro de su área (error de alcance por conjuntos)

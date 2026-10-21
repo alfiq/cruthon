@@ -1,0 +1,8 @@
+[render] tienda.html ['zapatos'] 49.9
+[checkout] listo
+carrito.items = ['zapatos']
+carrito.total = 49.9
+backend.validar_stock('zapatos') = True
+backend.calcular_envio(carrito.items) = 12.5
+frontend ve el total compartido = 49.9
+frontend NO ve db -> el blob 'frontend' no expone el miembro 'db': no vive dentro de su área (error de alcance por conjuntos)

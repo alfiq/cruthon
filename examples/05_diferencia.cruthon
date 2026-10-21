@@ -1,0 +1,34 @@
+# Ejemplo 5 del documento de diseño: diferencia (-), lo exclusivo de un blob
+# respecto al otro.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF no llama a `mostrar_beneficios_exclusivos()`: aquí se invoca.
+#   [M2] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+
+blob main:
+    blob plan_premium:
+        soporte_24h = True
+        exportar_pdf = True
+        exportar_csv = True
+
+    blob plan_gratis:
+        exportar_csv = True
+
+    blob solo_premium = plan_premium - plan_gratis:
+        # contiene soporte_24h y exportar_pdf, no exportar_csv
+        func mostrar_beneficios_exclusivos():
+            return ["soporte_24h", "exportar_pdf"]
+
+# [M1] el PDF define `mostrar_beneficios_exclusivos` pero nunca la llama
+print("solo_premium.mostrar_beneficios_exclusivos() =",
+      solo_premium.mostrar_beneficios_exclusivos())
+
+# [M2] lo que plan_premium y plan_gratis tienen en común queda excluido:
+# `exportar_csv` no vive dentro del área de `solo_premium`.
+print("solo_premium ve soporte_24h =", solo_premium.soporte_24h)
+print("solo_premium ve exportar_pdf =", solo_premium.exportar_pdf)
+try:
+    print("solo_premium ve exportar_csv =", solo_premium.exportar_csv)
+except ScopeError as error:
+    print("solo_premium NO ve exportar_csv ->", error)

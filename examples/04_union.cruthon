@@ -1,0 +1,35 @@
+# Ejemplo 4 del documento de diseño: unión (|), dos blobs bajo el mismo
+# proceso sin memoria común.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF llama a `incrementar(nombre)` sin definirla: se declara
+#        dentro de `metricas`, el blob que la usa.
+#   [M2] El PDF define `reportar(msg, evento)` pero no la llama: aquí se
+#        invoca.
+#   [M3] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+
+blob main:
+    blob logger:
+        func registrar(msg):
+            print(msg)
+
+    blob metricas:
+        # [M1] incrementar no está definido en el PDF
+        func incrementar(nombre):
+            print("[métrica]", nombre)
+
+        func contar_evento(nombre):
+            incrementar(nombre)
+
+    blob monitoreo = logger | metricas:
+        func reportar(msg, evento):
+            logger.registrar(msg)
+            metricas.contar_evento(evento)
+
+# [M2] el PDF define `reportar` pero nunca la llama
+monitoreo.reportar("sesión iniciada", "inicio_sesion")
+
+# [M3] resultados observables
+print("monitoreo ve registrar =", monitoreo.registrar)
+print("monitoreo ve contar_evento =", monitoreo.contar_evento)

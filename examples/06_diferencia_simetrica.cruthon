@@ -1,0 +1,32 @@
+# Ejemplo 6 del documento de diseño: diferencia simétrica (^), lo que ninguno
+# de los dos blobs comparte con el otro.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF no llama a `resumen_cambios()`: aquí se invoca.
+#   [M2] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+
+blob main:
+    blob version_a:
+        boton_grande = True
+        color_azul = True
+
+    blob version_b:
+        color_azul = True
+        boton_redondo = True
+
+    blob diferencias_ab = version_a ^ version_b:
+        # contiene boton_grande y boton_redondo, no color_azul
+        func resumen_cambios():
+            return ["boton_grande", "boton_redondo"]
+
+# [M1] el PDF define `resumen_cambios` pero nunca la llama
+print("diferencias_ab.resumen_cambios() =", diferencias_ab.resumen_cambios())
+
+# [M2] `color_azul` está en los dos blobs: la diferencia simétrica lo excluye.
+print("diferencias_ab ve boton_grande =", diferencias_ab.boton_grande)
+print("diferencias_ab ve boton_redondo =", diferencias_ab.boton_redondo)
+try:
+    print("diferencias_ab ve color_azul =", diferencias_ab.color_azul)
+except ScopeError as error:
+    print("diferencias_ab NO ve color_azul ->", error)

@@ -1,0 +1,81 @@
+# Ejemplo 1 del documento de diseño: main, frontend y backend.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF llama a `conectar_base_datos()` sin definirla y usa el
+#        resultado como si tuviera los métodos `consultar_tarifas` y `stock`.
+#        Aquí se define un doble mínimo, como un blob anidado, para que la
+#        línea original del PDF siga siendo válida.
+#   [M2] El PDF llama a `render(...)` y `mostrar_checkout()` sin definirlas:
+#        se declaran dentro de `frontend`, el blob que las usa.
+#   [M3] El PDF define `iniciar()` pero no la llama: aquí se invoca.
+#   [M4] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+
+blob main:
+    blob backend:
+        # [M1] doble mínimo de la base de datos
+        blob base:
+            func consultar_tarifas(items):
+                return 12.50
+
+            func stock(item):
+                return 3
+
+        func conectar_base_datos():
+            return base
+
+        db = conectar_base_datos()
+
+        func calcular_envio(items):
+            return db.consultar_tarifas(items)
+
+        func validar_stock(item):
+            return db.stock(item) > 0
+
+    blob frontend:
+        # [M2] render y mostrar_checkout no están definidos en el PDF
+        func render(plantilla, items, total):
+            print("[render]", plantilla, items, total)
+
+        func mostrar_checkout():
+            print("[checkout] listo")
+
+        func dibujar_pagina(carrito):
+            render("tienda.html", carrito.items, carrito.total)
+
+        func click_comprar():
+            mostrar_checkout()
+
+    blob carrito = frontend & backend:
+        items = []
+        total = 0.0
+
+        func agregar(item, precio):
+            items.append(item)
+            total += precio
+
+    func iniciar():
+        carrito.agregar("zapatos", 49.90)
+        frontend.dibujar_pagina(carrito)
+        backend.validar_stock("zapatos")
+
+# [M3] el PDF define `iniciar()` pero nunca la llama
+iniciar()
+frontend.click_comprar()
+
+# [M4] resultados observables
+print("carrito.items =", carrito.items)
+print("carrito.total =", carrito.total)
+print("backend.validar_stock('zapatos') =", backend.validar_stock("zapatos"))
+print("backend.calcular_envio(carrito.items) =", backend.calcular_envio(carrito.items))
+
+# La intersección es la única zona compartida: frontend y backend leen y
+# escriben el mismo `total`.
+print("frontend ve el total compartido =", frontend.total)
+
+# El frontend nunca ve `db`: lo que vive dentro de `backend` es inalcanzable
+# desde `frontend` (error de alcance por conjuntos, no un AttributeError).
+try:
+    print("frontend ve db =", frontend.db)
+except ScopeError as error:
+    print("frontend NO ve db ->", error)

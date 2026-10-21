@@ -1,0 +1,4 @@
+sesión iniciada
+[métrica] inicio_sesion
+monitoreo ve registrar = <func registrar>
+monitoreo ve contar_evento = <func contar_evento>

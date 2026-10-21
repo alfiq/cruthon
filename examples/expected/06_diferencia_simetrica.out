@@ -1,0 +1,4 @@
+diferencias_ab.resumen_cambios() = ['boton_grande', 'boton_redondo']
+diferencias_ab ve boton_grande = True
+diferencias_ab ve boton_redondo = True
+diferencias_ab NO ve color_azul -> el blob 'diferencias_ab' no expone el miembro 'color_azul': no vive dentro de su área (error de alcance por conjuntos)

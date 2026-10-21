@@ -1,0 +1,66 @@
+# Ejemplo 7 del documento de diseño: las cuatro operaciones de conjuntos
+# conviviendo dentro del mismo `main`.
+#
+# Modificaciones menores respecto al PDF (detalladas en examples/README.md):
+#   [M1] El PDF llama a `guardar_log(plan, funcion)` sin definirla: se declara
+#        dentro de `analitica`, el blob que la usa.
+#   [M2] El PDF define `iniciar_app(usuario, plan)` pero no la llama: aquí se
+#        invoca.
+#   [M3] El PDF no imprime nada: se añaden las salidas para poder guardar
+#        los resultados del ejemplo en el repositorio.
+
+blob main:
+    blob basico:
+        exportar_csv = True
+        soporte_email = True
+
+    blob pro:
+        exportar_csv = True
+        soporte_email = True
+        soporte_24h = True
+
+    api_acceso = True
+
+    # Intersección: lo que ambos planes comparten siempre
+    blob base_comun = basico & pro:
+        func funciones_garantizadas():
+            return ["exportar_csv", "soporte_email"]
+
+    # Diferencia: lo exclusivo de pro frente a basico
+    blob beneficios_pro = pro - basico:
+        func mostrar_upsell():
+            return ["soporte_24h", "api_acceso"]
+
+    # Diferencia simétrica: lo que distingue a cada plan del otro
+    # (coincide con beneficios_pro porque basico no tiene nada propio aquí)
+    blob distincion = basico ^ pro:
+        func resaltar_diferencias():
+            return ["soporte_24h", "api_acceso"]
+
+    blob analitica:
+        # [M1] guardar_log no está definido en el PDF
+        func guardar_log(plan, funcion):
+            print("[log]", plan, funcion)
+
+        func registrar_uso(plan, funcion):
+            guardar_log(plan, funcion)
+
+    # Unión: analitica corre junto a main sin compartir memoria con los planes
+    blob sistema = analitica | base_comun:
+        func iniciar_app(usuario, plan):
+            analitica.registrar_uso(plan, "inicio_sesion")
+            return base_comun.funciones_garantizadas()
+
+# [M2] el PDF define `iniciar_app` pero nunca la llama
+print("sistema.iniciar_app('ana', 'pro') =", sistema.iniciar_app("ana", "pro"))
+
+# [M3] resultados observables
+print("base_comun.funciones_garantizadas() =", base_comun.funciones_garantizadas())
+print("beneficios_pro.mostrar_upsell() =", beneficios_pro.mostrar_upsell())
+print("distincion.resaltar_diferencias() =", distincion.resaltar_diferencias())
+print("base_comun ve exportar_csv =", base_comun.exportar_csv)
+# `soporte_24h` sólo vive en `pro`: no forma parte de la intersección.
+try:
+    print("base_comun ve soporte_24h =", base_comun.soporte_24h)
+except ScopeError as error:
+    print("base_comun NO ve soporte_24h ->", error)

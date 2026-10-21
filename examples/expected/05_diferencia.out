@@ -1,0 +1,4 @@
+solo_premium.mostrar_beneficios_exclusivos() = ['soporte_24h', 'exportar_pdf']
+solo_premium ve soporte_24h = True
+solo_premium ve exportar_pdf = True
+solo_premium NO ve exportar_csv -> el blob 'solo_premium' no expone el miembro 'exportar_csv': no vive dentro de su área (error de alcance por conjuntos)
