@@ -228,7 +228,7 @@ class Interpreter:
         return None
 
     def _exec_aug_assign(self, node, blob, frame):
-        current = self.eval(_as_read(node.target), blob, frame)
+        current = self.eval(node.target, blob, frame)
         operand = self.eval(node.value, blob, frame)
         value = _BIN_OPS[node.op](current, operand)
         self.assign(node.target, value, blob, frame)
@@ -793,10 +793,3 @@ class Interpreter:
             if isinstance(left, Blob) and isinstance(right, Blob):
                 return SET_FUNCTIONS[source.op](left, right, name)
         return self.eval(source, blob, frame)
-
-
-def _as_read(node: Any) -> Any:
-    """Convierte un destino de asignación en una expresión legible."""
-    if isinstance(node, N.Name):
-        return node
-    return node

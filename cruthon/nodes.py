@@ -8,7 +8,7 @@ intérprete de árbol.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List as ListType, Optional
 
 
 @dataclass
@@ -42,8 +42,8 @@ class Subscript(Node):
 @dataclass
 class Call(Node):
     func: Any = None
-    args: List[Any] = field(default_factory=list)
-    keywords: List[Any] = field(default_factory=list)
+    args: ListType[Any] = field(default_factory=list)
+    keywords: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -68,14 +68,14 @@ class UnaryOp(Node):
 @dataclass
 class BoolOp(Node):
     op: str = "and"
-    values: List[Any] = field(default_factory=list)
+    values: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class Compare(Node):
     left: Any = None
     ops: List[str] = field(default_factory=list)
-    comparators: List[Any] = field(default_factory=list)
+    comparators: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -87,23 +87,23 @@ class IfExp(Node):
 
 @dataclass
 class Tuple(Node):
-    elts: List[Any] = field(default_factory=list)
+    elts: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class List(Node):
-    elts: List[Any] = field(default_factory=list)
+    elts: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class Set(Node):
-    elts: List[Any] = field(default_factory=list)
+    elts: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class Dict(Node):
-    keys: List[Any] = field(default_factory=list)
-    values: List[Any] = field(default_factory=list)
+    keys: ListType[Any] = field(default_factory=list)
+    values: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -117,32 +117,32 @@ class Slice(Node):
 class CompGenerator(Node):
     target: Any = None
     iter: Any = None
-    ifs: List[Any] = field(default_factory=list)
+    ifs: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class ListComp(Node):
     elt: Any = None
-    generators: List[Any] = field(default_factory=list)
+    generators: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class SetComp(Node):
     elt: Any = None
-    generators: List[Any] = field(default_factory=list)
+    generators: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class DictComp(Node):
     key: Any = None
     value: Any = None
-    generators: List[Any] = field(default_factory=list)
+    generators: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class GeneratorExp(Node):
     elt: Any = None
-    generators: List[Any] = field(default_factory=list)
+    generators: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -160,13 +160,13 @@ class FormattedValue(Node):
 
 @dataclass
 class JoinedStr(Node):
-    values: List[Any] = field(default_factory=list)
+    values: ListType[Any] = field(default_factory=list)
 
 
 # --------------------------------------------------------------- declaraciones
 @dataclass
 class Module(Node):
-    body: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -176,7 +176,7 @@ class ExprStmt(Node):
 
 @dataclass
 class Assign(Node):
-    targets: List[Any] = field(default_factory=list)
+    targets: ListType[Any] = field(default_factory=list)
     value: Any = None
 
 
@@ -193,15 +193,15 @@ class BlobDecl(Node):
 
     name: str = ""
     source: Any = None
-    body: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class FuncDef(Node):
     name: str = ""
     args: Any = None
-    body: List[Any] = field(default_factory=list)
-    decorators: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
+    decorators: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -212,11 +212,11 @@ class Arg(Node):
 
 @dataclass
 class Arguments(Node):
-    args: List[Any] = field(default_factory=list)
+    args: ListType[Any] = field(default_factory=list)
     vararg: Optional[str] = None
-    kwonlyargs: List[Any] = field(default_factory=list)
+    kwonlyargs: ListType[Any] = field(default_factory=list)
     kwarg: Optional[str] = None
-    defaults: List[Any] = field(default_factory=list)
+    defaults: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -242,34 +242,34 @@ class Continue(Node):
 @dataclass
 class If(Node):
     test: Any = None
-    body: List[Any] = field(default_factory=list)
-    orelse: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
+    orelse: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class While(Node):
     test: Any = None
-    body: List[Any] = field(default_factory=list)
-    orelse: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
+    orelse: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class For(Node):
     target: Any = None
     iter: Any = None
-    body: List[Any] = field(default_factory=list)
-    orelse: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
+    orelse: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class Import(Node):
-    names: List[Any] = field(default_factory=list)
+    names: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class ImportFrom(Node):
     module: str = ""
-    names: List[Any] = field(default_factory=list)
+    names: ListType[Any] = field(default_factory=list)
     level: int = 0
 
 
@@ -281,7 +281,7 @@ class ImportAlias(Node):
 
 @dataclass
 class Delete(Node):
-    targets: List[Any] = field(default_factory=list)
+    targets: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -302,14 +302,14 @@ class Assert(Node):
 
 @dataclass
 class Try(Node):
-    body: List[Any] = field(default_factory=list)
-    handlers: List[Any] = field(default_factory=list)
-    orelse: List[Any] = field(default_factory=list)
-    finalbody: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
+    handlers: ListType[Any] = field(default_factory=list)
+    orelse: ListType[Any] = field(default_factory=list)
+    finalbody: ListType[Any] = field(default_factory=list)
 
 
 @dataclass
 class ExceptHandler(Node):
     type: Any = None
     name: Optional[str] = None
-    body: List[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)

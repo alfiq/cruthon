@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 
 from cruthon import Interpreter, parse
-from cruthon.blobs import Blob, difference, intersect, symmetric_difference, union
+from cruthon.blobs import Blob, intersect
 from cruthon.errors import NameNotFound, ScopeError
 
 

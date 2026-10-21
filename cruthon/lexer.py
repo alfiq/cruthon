@@ -14,7 +14,7 @@ lenguaje:
 from __future__ import annotations
 
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .errors import CruthonSyntaxError, IncompleteInput
 

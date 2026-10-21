@@ -15,7 +15,7 @@ from typing import List
 
 import pytest
 
-from cruthon import CruthonREPL, Interpreter
+from cruthon import CruthonREPL
 
 
 class _Entrada:
