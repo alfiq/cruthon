@@ -1,7 +1,7 @@
 # Texto extraído de la especificación
 
 Extracción automática del PDF `Cruthon un lenguaje basado en teoría de conjuntos.pdf`
-(11 páginas) para poder consultar la especificación en texto plano.
+(12 páginas) para poder consultar la especificación en texto plano.
 
 ```
 
@@ -407,4 +407,36 @@ Queda prohibida su reproducción, distribución, modificación o uso, total o pa
 autorización expresa y por escrito del autor.
 Cruthon: un lenguaje basado en teoría de conjuntos
 Page 11 of 11
+--- pagina 12 ---
+Cruthon: un lenguaje basado en teoría de conjuntos
+Page 12 of 12
+Interpretación: Cruthon se ejecuta como
+Python
+Cruthon se interpreta igual que Python: el código no se compila por adelantado, sino que se
+analiza y se ejecuta conforme se lee, instrucción por instrucción, tal como ocurre en la consola de
+Python.
+En la práctica, esto significa que el estado de los blobs es visible en el momento: cada
+instrucción se evalúa y muestra su resultado mientras se teclea, y las tablas de pertenencia
+a conjuntos se recalculan con cada línea escrita. No hay paso de compilación ni archivos
+intermedios que mantener sincronizados.
+Cómo se ejecuta
+  En la REPL, cada instrucción se ejecuta al teclearla y muestra su resultado, como el
+intérprete de CPython.
+ Un bloque (una declaración blob o una func) se acumula hasta que la línea siguiente
+empieza en la primera columna, o hasta que se escribe una línea en blanco: es la misma
+regla que usa codeop en CPython.
+ Un error de alcance por conjuntos no termina la sesión: la REPL lo reporta y sigue
+leyendo, como hace la consola de Python.
+El ejecutable
+cruthon # abre la REPL
+cruthon ejemplo.cruthon # ejecuta un archivo
+cruthon -c "blob main: ..." # ejecuta un fragmento
+El intérprete está escrito en Python siguiendo la estructura del repositorio de CPython: el
+tokenizador usa el mismo modelo de sangría, el analizador desciende recursivamente sobre
+el árbol de sintaxis y el evaluador lo recorre sustituyendo la resolución por MRO por la
+resolución por pertenencia a conjuntos.
+Los ejemplos de este documento se ejecutan tal cual (con las modificaciones menores
+anotadas en cada archivo) y sus resultados quedan guardados en el repositorio, junto a las
+pruebas que verifican que el intérprete sigue esas reglas.
+
 ```
