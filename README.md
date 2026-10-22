@@ -11,6 +11,12 @@ diferencia (`-`) y diferencia simétrica (`^`).
 Como Python, **Cruthon se interpreta**: el código se ejecuta conforme se lee,
 instrucción por instrucción, tanto en un archivo como en la REPL.
 
+> **Cómo se implementó.** El documento de diseño propone dos vías: un fork de
+> CPython con un opcode `RESOLVE_MEMBER`, o un repositorio independiente que
+> lo referencie. Aquí se tomó la segunda, y la decisión está escrita en
+> [`docs/estrategia.md`](docs/estrategia.md), con el estado del fork
+> experimental en [`fork/`](fork/).
+
 ---
 
 ## Instalación
@@ -55,6 +61,7 @@ Escribe 'salir()' para terminar, '%blobs' para ver los blobs vivos,
 >>> blob main:
 ...     token = "abc"
 ...
+<blob main>
 >>> main.token
 'abc'
 >>> salir()
@@ -71,8 +78,8 @@ Dos comandos de diagnóstico (no forman parte del lenguaje):
 
 ### Blobs
 
-Un *blob* es un conjunto con memoria propia. Reemplaza a la clase: no hay
-herencia, hay pertenencia geométrica.
+Un *blob* es un conjunto con memoria propia. Sustituye a la clase *en el
+modelo de conjuntos*: entre blobs no hay herencia, hay pertenencia geométrica.
 
 ```cruthon
 blob main:
@@ -126,6 +133,45 @@ Una función se ejecuta **siempre con el ámbito del blob donde está físicamen
 definida**, nunca con el de quien la llama. Quien llama sólo entra por la
 puerta de su blob; adentro, la función ve lo que vive en el suyo.
 
+### Clases
+
+`class` existe y funciona como en Python, con una diferencia de ámbito: un
+método se ejecuta con el ámbito del blob donde se definió la clase, no con el
+de quien llama. Es la misma regla que rige a las funciones.
+
+```cruthon
+class Contador:
+    def __init__(self, inicio=0):
+        self.valor = inicio
+
+    def sumar(self, n):
+        self.valor += n
+        return self.valor
+
+c = Contador(10)
+print(c.sumar(5))          # 15
+```
+
+Hay herencia, `super()`, decoradores (`@property`, `@classmethod`,
+`@staticmethod` y los propios) y los métodos especiales de Python
+(`__init__`, `__len__`, `__getitem__`, `__iter__`, `__eq__`…). También se
+pueden heredar tipos de Python: la instancia se apoya entonces en un objeto
+nativo.
+
+```cruthon
+class Pila(list):
+    def top(self):
+        return self[-1]
+
+p = Pila([1, 2, 3])
+print(p.top(), len(p))     # 3 3
+```
+
+Pero **`class` no interactúa con los blobs**: un blob no es una clase y una
+clase no es un blob. Es la frontera explícita del lenguaje, y el motivo por
+el que el documento de diseño puede decir que el blob *sustituye* a la clase
+sin tener que prohibirse la clase.
+
 ### La tabla de pertenencia
 
 Cada blob mantiene una tabla que dice **en qué blobs vive cada nombre**. Es el
@@ -138,12 +184,83 @@ $ cruthon -p -c "blob main:
 ...         x = 1
 ...     blob b:
 ...         x = 2"
+
 Tabla de pertenencia (nombre -> blobs donde vive):
-  a: __main__
-  b: __main__
+  a: main
+  b: main
   main: __main__
   x: a, b
 ```
+
+## Diferencias respecto a CPython estándar
+
+El punto 7 del documento pide "documentar las diferencias respecto a CPython
+estándar". Esta es la lista completa.
+
+### El lenguaje comparte las reglas de Python, con dos construcciones propias
+
+Cruthon **no** es un superconjunto de Python. Comparte casi toda la sintaxis
+y se ejecuta como Python, pero difiere en tres puntos concretos:
+
+1. Los cuatro operadores `&`, `|`, `-` y `^` entre dos *blobs* ejecutan
+   operaciones de conjuntos. Entre cualquier otro valor son los operadores
+   bit a bit de Python, sin cambios.
+2. El ámbito de una función es el blob donde está definida, no el espacio de
+   nombres donde se escribe.
+3. Un nombre que no vive dentro del área del blob activo produce un
+   `ScopeError`, no un `NameError` ni un `AttributeError`.
+
+Las dos construcciones *nuevas* son:
+
+| Cruthon | Equivalente en CPython |
+| --- | --- |
+| `blob nombre:` | una clase, sin herencia implícita |
+| `blob nombre = a & b:` | una intersección entre dos clases |
+
+`func` es un alias de `def`. `class` también existe, con herencia, `super()`,
+decoradores, herencia de tipos de Python y los métodos especiales de Python
+(ver [Clases](#clases)); pero **no** interactúa con los blobs: un blob no es
+una clase y una clase no es un blob.
+
+### Lo que cambia al definir el lenguaje
+
+* **El scope.** Una función se ejecuta siempre con el ámbito del blob donde
+  está físicamente definida. En Python, una función ve el espacio de nombres
+  donde se *define*, pero hereda el global; aquí el ámbito es el blob, y el
+  de quien llama no se mezcla. Esto también afecta a los métodos: un método
+  se ejecuta con el ámbito del blob donde se definió la clase.
+* **El error de alcance.** Cuando un nombre no vive dentro del área del blob
+  activo, Cruthon lanza `ScopeError` (un `RuntimeError`) en vez de un
+  `AttributeError` o un `NameError`. El nombre existe en el programa, pero
+  en otro blob: es un problema de geometría, no de jerarquía.
+* **Los cuatro operadores.** `&`, `|`, `-` y `^` entre dos *blobs* ejecutan
+  operaciones de conjuntos. Entre cualquier otro valor son los operadores
+  bit a bit de Python, sin cambios.
+
+### Lo que no está implementado
+
+* `nonlocal` funciona, pero `global` sólo aplica al ámbito global del
+  intérprete.
+* La biblioteca estándar se importa completa, pero sólo un subconjunto de
+  *builtins* está disponible dentro de un blob (la lista está en
+  [`cruthon/builtins.py`](cruthon/builtins.py)); lo que no está, no se ve.
+* No hay `async`/`await` ni `match`.
+* El intérprete no genera bytecode: es un evaluador de árbol de sintaxis,
+  como el de un intérprete pedagogy. La diferencia observable es el
+  rendimiento, no la semántica.
+
+### Lo que se verificó
+
+[`tests/test_paridad.py`](tests/test_paridad.py) ejecuta los mismos
+fragmentos en Cruthon y en CPython y compara la salida byte a byte. Cubre
+escapes de cadena, f-strings, comprehensions (y expresiones generadoras),
+`del`, `global`, `nonlocal`, closures, `*args`/`**kwargs`, argumentos por
+palabra clave, slices, excepciones (`raise`, `except` con tupla, `finally`),
+`import` de la biblioteca estándar, las operaciones aritméticas, las clases
+(herencia, `super()`, `__init__`, `__len__`, `__eq__`, `__repr__`), los
+decoradores (`@property`, `@classmethod`, `@staticmethod`), los generadores
+(`yield`, `yield from`), el gestor de contexto (`with`, con uno y con varios
+gestores) y la herencia de tipos de Python (`class M(list):`).
 
 ## Arquitectura
 
@@ -156,6 +273,7 @@ desde cero en Python puro (sin bytecode, sin C):
 | [`cruthon/nodes.py`](cruthon/nodes.py) | `Parser/ast.h` | nodos del árbol de sintaxis |
 | [`cruthon/parser.py`](cruthon/parser.py) | `Parser/parser.c` | analizador descendente recursivo; añade `blob` y las operaciones de conjuntos |
 | [`cruthon/blobs.py`](cruthon/blobs.py) | `Objects/typeobject.c` | el modelo de blobs: memoria, tabla de pertenencia y las cuatro operaciones |
+| [`cruthon/classes.py`](cruthon/classes.py) | `Objects/typeobject.c` + `Objects/classobject.c` | las clases de Python: MRO con linealización C3, instancias, `super()` y el protocolo de métodos especiales |
 | [`cruthon/interpreter.py`](cruthon/interpreter.py) | `Python/compile.c` + `Python/ceval.c` | evaluador: resuelve nombres por pertenencia a conjuntos en vez de por MRO |
 | [`cruthon/repl.py`](cruthon/repl.py) | `Lib/code.py` | la REPL: lee, analiza y ejecuta conforme se lee |
 | [`cruthon/cli.py`](cruthon/cli.py) | `Programs/_freeze_module.c` | el ejecutable `cruthon` |
@@ -183,7 +301,7 @@ python tools/run_examples.py --update   # regenera los resultados
 ## Pruebas
 
 ```bash
-python -m pytest            # 82 pruebas: léxico, sintaxis, semántica, REPL, CLI, ejemplos y PDF
+python -m pytest            # 265 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos y PDF
 ```
 
 ## El documento de diseño

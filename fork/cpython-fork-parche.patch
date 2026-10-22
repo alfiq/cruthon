@@ -1,0 +1,438 @@
+diff --git a/Grammar/python.gram b/Grammar/python.gram
+index 7b27b04..6c352e7 100644
+--- a/Grammar/python.gram
++++ b/Grammar/python.gram
+@@ -135,13 +135,14 @@ simple_stmt[stmt_ty] (memo):
+     | &'nonlocal' nonlocal_stmt
+ 
+ compound_stmt[stmt_ty]:
+-    | &('def' | '@' | 'async') function_def
++    | &('def' | 'func' | '@' | 'async') function_def
+     | &'if' if_stmt
+     | &('class' | '@') class_def
+     | &('with' | 'async') with_stmt
+     | &('for' | 'async') for_stmt
+     | &'try' try_stmt
+     | &'while' while_stmt
++    | &'blob' blob_stmt
+     | match_stmt
+ 
+ # SIMPLE STATEMENTS
+@@ -278,6 +279,19 @@ class_def_raw[stmt_ty]:
+                      (b) ? ((expr_ty) b)->v.Call.keywords : NULL,
+                      c, NULL, t, EXTRA) }
+ 
++# Blob declarations
++# ------------------
++#
++# A 'blob' declares a set with its own memory.  Its body is a scope of its
++# own: the names defined there live in the blob's namespace, and the functions
++# defined inside it always see that namespace (never the caller's).
++#
++# 'blob NAME = a & b:' derives the new blob from an operation between sets.
++
++blob_stmt[stmt_ty]:
++    | 'blob' n=NAME s=['=' e=expression { e }] ':' b=block {
++        _PyAST_Blob(n->v.Name.id, s, b, EXTRA) }
++
+ # Function definitions
+ # --------------------
+ 
+@@ -291,6 +305,10 @@ function_def_raw[stmt_ty]:
+         _PyAST_FunctionDef(n->v.Name.id,
+                         (params) ? params : CHECK(arguments_ty, _PyPegen_empty_arguments(p)),
+                         b, NULL, a, NEW_TYPE_COMMENT(p, tc), t, EXTRA) }
++    | 'func' n=NAME t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=block {
++        _PyAST_FunctionDef(n->v.Name.id,
++                        (params) ? params : CHECK(arguments_ty, _PyPegen_empty_arguments(p)),
++                        b, NULL, a, NEW_TYPE_COMMENT(p, tc), t, EXTRA) }
+     | 'async' 'def' n=NAME t=[type_params] '(' params=[params] ')' a=['->' z=expression { z }] ':' tc=[func_type_comment] b=block {
+         CHECK_VERSION(
+             stmt_ty,
+diff --git a/Include/internal/pycore_ast.h b/Include/internal/pycore_ast.h
+index 6036720..0a49e56 100644
+--- a/Include/internal/pycore_ast.h
++++ b/Include/internal/pycore_ast.h
+@@ -185,14 +185,14 @@ struct _mod {
+ };
+ 
+ enum _stmt_kind {FunctionDef_kind=1, AsyncFunctionDef_kind=2, ClassDef_kind=3,
+-                  Return_kind=4, Delete_kind=5, Assign_kind=6,
+-                  TypeAlias_kind=7, AugAssign_kind=8, AnnAssign_kind=9,
+-                  For_kind=10, AsyncFor_kind=11, While_kind=12, If_kind=13,
+-                  With_kind=14, AsyncWith_kind=15, Match_kind=16,
+-                  Raise_kind=17, Try_kind=18, TryStar_kind=19, Assert_kind=20,
+-                  Import_kind=21, ImportFrom_kind=22, Global_kind=23,
+-                  Nonlocal_kind=24, Expr_kind=25, Pass_kind=26, Break_kind=27,
+-                  Continue_kind=28};
++                  Blob_kind=4, Return_kind=5, Delete_kind=6, Assign_kind=7,
++                  TypeAlias_kind=8, AugAssign_kind=9, AnnAssign_kind=10,
++                  For_kind=11, AsyncFor_kind=12, While_kind=13, If_kind=14,
++                  With_kind=15, AsyncWith_kind=16, Match_kind=17,
++                  Raise_kind=18, Try_kind=19, TryStar_kind=20, Assert_kind=21,
++                  Import_kind=22, ImportFrom_kind=23, Global_kind=24,
++                  Nonlocal_kind=25, Expr_kind=26, Pass_kind=27, Break_kind=28,
++                  Continue_kind=29};
+ struct _stmt {
+     enum _stmt_kind kind;
+     union {
+@@ -225,6 +225,12 @@ struct _stmt {
+             asdl_type_param_seq *type_params;
+         } ClassDef;
+ 
++        struct {
++            identifier name;
++            expr_ty source;
++            asdl_stmt_seq *body;
++        } Blob;
++
+         struct {
+             expr_ty value;
+         } Return;
+@@ -713,6 +719,9 @@ stmt_ty _PyAST_ClassDef(identifier name, asdl_expr_seq * bases,
+                         asdl_expr_seq * decorator_list, asdl_type_param_seq *
+                         type_params, int lineno, int col_offset, int
+                         end_lineno, int end_col_offset, PyArena *arena);
++stmt_ty _PyAST_Blob(identifier name, expr_ty source, asdl_stmt_seq * body, int
++                    lineno, int col_offset, int end_lineno, int end_col_offset,
++                    PyArena *arena);
+ stmt_ty _PyAST_Return(expr_ty value, int lineno, int col_offset, int
+                       end_lineno, int end_col_offset, PyArena *arena);
+ stmt_ty _PyAST_Delete(asdl_expr_seq * targets, int lineno, int col_offset, int
+diff --git a/Include/internal/pycore_ast_state.h b/Include/internal/pycore_ast_state.h
+index d4ac419..e694c5a 100644
+--- a/Include/internal/pycore_ast_state.h
++++ b/Include/internal/pycore_ast_state.h
+@@ -37,6 +37,7 @@ struct ast_state {
+     PyObject *BitOr_type;
+     PyObject *BitXor_singleton;
+     PyObject *BitXor_type;
++    PyObject *Blob_type;
+     PyObject *BoolOp_type;
+     PyObject *Break_type;
+     PyObject *Call_type;
+@@ -242,6 +243,7 @@ struct ast_state {
+     PyObject *right;
+     PyObject *simple;
+     PyObject *slice;
++    PyObject *source;
+     PyObject *step;
+     PyObject *stmt_type;
+     PyObject *str;
+diff --git a/Lib/keyword.py b/Lib/keyword.py
+index e22c837..aab91f0 100644
+--- a/Lib/keyword.py
++++ b/Lib/keyword.py
+@@ -24,6 +24,7 @@ kwlist = [
+     'assert',
+     'async',
+     'await',
++    'blob',
+     'break',
+     'class',
+     'continue',
+@@ -35,6 +36,7 @@ kwlist = [
+     'finally',
+     'for',
+     'from',
++    'func',
+     'global',
+     'if',
+     'import',
+diff --git a/Parser/Python.asdl b/Parser/Python.asdl
+index 9c7529c..d6d9f50 100644
+--- a/Parser/Python.asdl
++++ b/Parser/Python.asdl
+@@ -21,6 +21,7 @@ module Python
+              stmt* body,
+              expr* decorator_list,
+              type_param* type_params)
++          | Blob(identifier name, expr? source, stmt* body)
+           | Return(expr? value)
+ 
+           | Delete(expr* targets)
+diff --git a/Python/Python-ast.c b/Python/Python-ast.c
+index 1cc88dc..6466acf 100644
+--- a/Python/Python-ast.c
++++ b/Python/Python-ast.c
+@@ -54,6 +54,7 @@ void _PyAST_Fini(PyInterpreterState *interp)
+     Py_CLEAR(state->BitOr_type);
+     Py_CLEAR(state->BitXor_singleton);
+     Py_CLEAR(state->BitXor_type);
++    Py_CLEAR(state->Blob_type);
+     Py_CLEAR(state->BoolOp_type);
+     Py_CLEAR(state->Break_type);
+     Py_CLEAR(state->Call_type);
+@@ -259,6 +260,7 @@ void _PyAST_Fini(PyInterpreterState *interp)
+     Py_CLEAR(state->right);
+     Py_CLEAR(state->simple);
+     Py_CLEAR(state->slice);
++    Py_CLEAR(state->source);
+     Py_CLEAR(state->step);
+     Py_CLEAR(state->stmt_type);
+     Py_CLEAR(state->str);
+@@ -359,6 +361,7 @@ static int init_identifiers(struct ast_state *state)
+     if ((state->right = PyUnicode_InternFromString("right")) == NULL) return -1;
+     if ((state->simple = PyUnicode_InternFromString("simple")) == NULL) return -1;
+     if ((state->slice = PyUnicode_InternFromString("slice")) == NULL) return -1;
++    if ((state->source = PyUnicode_InternFromString("source")) == NULL) return -1;
+     if ((state->step = PyUnicode_InternFromString("step")) == NULL) return -1;
+     if ((state->str = PyUnicode_InternFromString("str")) == NULL) return -1;
+     if ((state->subject = PyUnicode_InternFromString("subject")) == NULL) return -1;
+@@ -440,6 +443,11 @@ static const char * const ClassDef_fields[]={
+     "decorator_list",
+     "type_params",
+ };
++static const char * const Blob_fields[]={
++    "name",
++    "source",
++    "body",
++};
+ static const char * const Return_fields[]={
+     "value",
+ };
+@@ -1295,6 +1303,61 @@ add_ast_annotations(struct ast_state *state)
+         return 0;
+     }
+     Py_DECREF(ClassDef_annotations);
++    PyObject *Blob_annotations = PyDict_New();
++    if (!Blob_annotations) return 0;
++    {
++        PyObject *type = (PyObject *)&PyUnicode_Type;
++        Py_INCREF(type);
++        cond = PyDict_SetItemString(Blob_annotations, "name", type) == 0;
++        Py_DECREF(type);
++        if (!cond) {
++            Py_DECREF(Blob_annotations);
++            return 0;
++        }
++    }
++    {
++        PyObject *type = state->expr_type;
++        type = _Py_union_type_or(type, Py_None);
++        cond = type != NULL;
++        if (!cond) {
++            Py_DECREF(Blob_annotations);
++            return 0;
++        }
++        cond = PyDict_SetItemString(Blob_annotations, "source", type) == 0;
++        Py_DECREF(type);
++        if (!cond) {
++            Py_DECREF(Blob_annotations);
++            return 0;
++        }
++    }
++    {
++        PyObject *type = state->stmt_type;
++        type = Py_GenericAlias((PyObject *)&PyList_Type, type);
++        cond = type != NULL;
++        if (!cond) {
++            Py_DECREF(Blob_annotations);
++            return 0;
++        }
++        cond = PyDict_SetItemString(Blob_annotations, "body", type) == 0;
++        Py_DECREF(type);
++        if (!cond) {
++            Py_DECREF(Blob_annotations);
++            return 0;
++        }
++    }
++    cond = PyObject_SetAttrString(state->Blob_type, "_field_types",
++                                  Blob_annotations) == 0;
++    if (!cond) {
++        Py_DECREF(Blob_annotations);
++        return 0;
++    }
++    cond = PyObject_SetAttrString(state->Blob_type, "__annotations__",
++                                  Blob_annotations) == 0;
++    if (!cond) {
++        Py_DECREF(Blob_annotations);
++        return 0;
++    }
++    Py_DECREF(Blob_annotations);
+     PyObject *Return_annotations = PyDict_New();
+     if (!Return_annotations) return 0;
+     {
+@@ -6201,6 +6264,7 @@ init_types(void *arg)
+         "stmt = FunctionDef(identifier name, arguments args, stmt* body, expr* decorator_list, expr? returns, string? type_comment, type_param* type_params)\n"
+         "     | AsyncFunctionDef(identifier name, arguments args, stmt* body, expr* decorator_list, expr? returns, string? type_comment, type_param* type_params)\n"
+         "     | ClassDef(identifier name, expr* bases, keyword* keywords, stmt* body, expr* decorator_list, type_param* type_params)\n"
++        "     | Blob(identifier name, expr? source, stmt* body)\n"
+         "     | Return(expr? value)\n"
+         "     | Delete(expr* targets)\n"
+         "     | Assign(expr* targets, expr value, string? type_comment)\n"
+@@ -6259,6 +6323,12 @@ init_types(void *arg)
+                                      ClassDef_fields, 6,
+         "ClassDef(identifier name, expr* bases, keyword* keywords, stmt* body, expr* decorator_list, type_param* type_params)");
+     if (!state->ClassDef_type) return -1;
++    state->Blob_type = make_type(state, "Blob", state->stmt_type, Blob_fields,
++                                 3,
++        "Blob(identifier name, expr? source, stmt* body)");
++    if (!state->Blob_type) return -1;
++    if (PyObject_SetAttr(state->Blob_type, state->source, Py_None) == -1)
++        return -1;
+     state->Return_type = make_type(state, "Return", state->stmt_type,
+                                    Return_fields, 1,
+         "Return(expr? value)");
+@@ -7182,6 +7252,30 @@ _PyAST_ClassDef(identifier name, asdl_expr_seq * bases, asdl_keyword_seq *
+     return p;
+ }
+ 
++stmt_ty
++_PyAST_Blob(identifier name, expr_ty source, asdl_stmt_seq * body, int lineno,
++            int col_offset, int end_lineno, int end_col_offset, PyArena *arena)
++{
++    stmt_ty p;
++    if (!name) {
++        PyErr_SetString(PyExc_ValueError,
++                        "field 'name' is required for Blob");
++        return NULL;
++    }
++    p = (stmt_ty)_PyArena_Malloc(arena, sizeof(*p));
++    if (!p)
++        return NULL;
++    p->kind = Blob_kind;
++    p->v.Blob.name = name;
++    p->v.Blob.source = source;
++    p->v.Blob.body = body;
++    p->lineno = lineno;
++    p->col_offset = col_offset;
++    p->end_lineno = end_lineno;
++    p->end_col_offset = end_col_offset;
++    return p;
++}
++
+ stmt_ty
+ _PyAST_Return(expr_ty value, int lineno, int col_offset, int end_lineno, int
+               end_col_offset, PyArena *arena)
+@@ -9101,6 +9195,26 @@ ast2obj_stmt(struct ast_state *state, void* _o)
+             goto failed;
+         Py_DECREF(value);
+         break;
++    case Blob_kind:
++        tp = (PyTypeObject *)state->Blob_type;
++        result = PyType_GenericNew(tp, NULL, NULL);
++        if (!result) goto failed;
++        value = ast2obj_identifier(state, o->v.Blob.name);
++        if (!value) goto failed;
++        if (PyObject_SetAttr(result, state->name, value) == -1)
++            goto failed;
++        Py_DECREF(value);
++        value = ast2obj_expr(state, o->v.Blob.source);
++        if (!value) goto failed;
++        if (PyObject_SetAttr(result, state->source, value) == -1)
++            goto failed;
++        Py_DECREF(value);
++        value = ast2obj_list(state, (asdl_seq*)o->v.Blob.body, ast2obj_stmt);
++        if (!value) goto failed;
++        if (PyObject_SetAttr(result, state->body, value) == -1)
++            goto failed;
++        Py_DECREF(value);
++        break;
+     case Return_kind:
+         tp = (PyTypeObject *)state->Return_type;
+         result = PyType_GenericNew(tp, NULL, NULL);
+@@ -11847,6 +11961,93 @@ obj2ast_stmt(struct ast_state *state, PyObject* obj, stmt_ty* out, PyArena*
+         if (*out == NULL) goto failed;
+         return 0;
+     }
++    tp = state->Blob_type;
++    isinstance = PyObject_IsInstance(obj, tp);
++    if (isinstance == -1) {
++        return -1;
++    }
++    if (isinstance) {
++        identifier name;
++        expr_ty source;
++        asdl_stmt_seq* body;
++
++        if (PyObject_GetOptionalAttr(obj, state->name, &tmp) < 0) {
++            return -1;
++        }
++        if (tmp == NULL) {
++            PyErr_SetString(PyExc_TypeError, "required field \"name\" missing from Blob");
++            return -1;
++        }
++        else {
++            int res;
++            if (_Py_EnterRecursiveCall(" while traversing 'Blob' node")) {
++                goto failed;
++            }
++            res = obj2ast_identifier(state, tmp, &name, arena);
++            _Py_LeaveRecursiveCall();
++            if (res != 0) goto failed;
++            Py_CLEAR(tmp);
++        }
++        if (PyObject_GetOptionalAttr(obj, state->source, &tmp) < 0) {
++            return -1;
++        }
++        if (tmp == NULL || tmp == Py_None) {
++            Py_CLEAR(tmp);
++            source = NULL;
++        }
++        else {
++            int res;
++            if (_Py_EnterRecursiveCall(" while traversing 'Blob' node")) {
++                goto failed;
++            }
++            res = obj2ast_expr(state, tmp, &source, arena);
++            _Py_LeaveRecursiveCall();
++            if (res != 0) goto failed;
++            Py_CLEAR(tmp);
++        }
++        if (PyObject_GetOptionalAttr(obj, state->body, &tmp) < 0) {
++            return -1;
++        }
++        if (tmp == NULL) {
++            tmp = PyList_New(0);
++            if (tmp == NULL) {
++                return -1;
++            }
++        }
++        {
++            int res;
++            Py_ssize_t len;
++            Py_ssize_t i;
++            if (!PyList_Check(tmp)) {
++                PyErr_Format(PyExc_TypeError, "Blob field \"body\" must be a list, not a %.200s", _PyType_Name(Py_TYPE(tmp)));
++                goto failed;
++            }
++            len = PyList_GET_SIZE(tmp);
++            body = _Py_asdl_stmt_seq_new(len, arena);
++            if (body == NULL) goto failed;
++            for (i = 0; i < len; i++) {
++                stmt_ty val;
++                PyObject *tmp2 = Py_NewRef(PyList_GET_ITEM(tmp, i));
++                if (_Py_EnterRecursiveCall(" while traversing 'Blob' node")) {
++                    goto failed;
++                }
++                res = obj2ast_stmt(state, tmp2, &val, arena);
++                _Py_LeaveRecursiveCall();
++                Py_DECREF(tmp2);
++                if (res != 0) goto failed;
++                if (len != PyList_GET_SIZE(tmp)) {
++                    PyErr_SetString(PyExc_RuntimeError, "Blob field \"body\" changed size during iteration");
++                    goto failed;
++                }
++                asdl_seq_SET(body, i, val);
++            }
++            Py_CLEAR(tmp);
++        }
++        *out = _PyAST_Blob(name, source, body, lineno, col_offset, end_lineno,
++                           end_col_offset, arena);
++        if (*out == NULL) goto failed;
++        return 0;
++    }
+     tp = state->Return_type;
+     isinstance = PyObject_IsInstance(obj, tp);
+     if (isinstance == -1) {
+@@ -18028,6 +18229,9 @@ astmodule_exec(PyObject *m)
+     if (PyModule_AddObjectRef(m, "ClassDef", state->ClassDef_type) < 0) {
+         return -1;
+     }
++    if (PyModule_AddObjectRef(m, "Blob", state->Blob_type) < 0) {
++        return -1;
++    }
+     if (PyModule_AddObjectRef(m, "Return", state->Return_type) < 0) {
+         return -1;
+     }

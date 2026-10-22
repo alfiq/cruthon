@@ -9,3 +9,7 @@ htmlcov/
 .venv/
 venv/
 .freebuff/
+
+# Clon de CPython usado como referencia estructural: es enorme y se vuelve a
+# bajar con `git clone`, así que no vive en el repositorio.
+cpython/

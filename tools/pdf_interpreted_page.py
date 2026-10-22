@@ -11,6 +11,10 @@ Uso::
 
     python tools/pdf_interpreted_page.py            # actualiza el PDF del repo
     python tools/pdf_interpreted_page.py --salida X.pdf
+
+La operación es **idempotente**: si el PDF ya trae la página añadida, se
+retira antes de volver a generarla, de modo que running the tool dos veces
+no deja dos páginas iguales al final.
 """
 
 from __future__ import annotations
@@ -30,6 +34,10 @@ MARGIN_TOP = 54.0
 MARGIN_BOTTOM = 54.0
 
 TITULO = "Interpretación: Cruthon se ejecuta como Python"
+
+#: Marca que delata las páginas añadidas por esta herramienta. Sirve para
+#: hacer la operación idempotente: se buscan y se retiran antes de añadir.
+MARCADOR = "Interpretación: Cruthon se ejecuta como Python"
 
 PARRAFOS = [
     (
@@ -195,15 +203,39 @@ def construir_pagina(destino: Path, total_paginas: int) -> None:
     documento.build(historia, onFirstPage=_pie_final, onLaterPages=_pie_final)
 
 
+def _es_pagina_anadida(pagina) -> bool:
+    """¿Es una página generada por esta herramienta?
+
+    Se reconoce por su título: es la única página del documento con esa
+    frase. El texto extraído se normaliza (los espacios y los saltos de
+    línea se unifican) porque el título se parte en varias líneas al
+    extraerlo. Si el texto no se puede extraer, se asume que la página no es
+    añadida y se conserva, que es lo seguro.
+    """
+    try:
+        texto = pagina.extract_text() or ""
+    except Exception:  # noqa: BLE001 - un PDF raro no debe romper la herramienta
+        return False
+    return MARCADOR in " ".join(texto.split())
+
+
 def actualizar(origen: Path, salida: Path) -> None:
-    """Une la página nueva al PDF original."""
+    """Une la página nueva al PDF original.
+
+    Es idempotente: las páginas añadidas por una ejecución anterior se
+    retiran antes de añadir la nueva, así que el resultado no crece con cada
+    ejecución.
+    """
     lector = PdfReader(str(origen))
-    total = len(lector.pages) + 1
+    originales = [
+        pagina for pagina in lector.pages if not _es_pagina_anadida(pagina)
+    ]
+    total = len(originales) + 1
     pagina_nueva = salida.with_name(salida.stem + "_pagina.pdf")
     construir_pagina(pagina_nueva, total)
 
     escritor = PdfWriter()
-    for pagina in lector.pages:
+    for pagina in originales:
         escritor.add_page(pagina)
     for pagina in PdfReader(str(pagina_nueva)).pages:
         escritor.add_page(pagina)
