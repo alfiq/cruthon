@@ -33,6 +33,7 @@ from .classes import (
     CruthonInstance,
     CruthonMethod,
     SuperFabrica,
+    _Docstring,
     buscar_metodo,
 )
 from .errors import (
@@ -40,9 +41,12 @@ from .errors import (
     CruthonError,
     CruthonRuntimeError,
     CruthonSyntaxError,
+    CruthonTypeError,
     NameNotFound,
     ScopeError,
 )
+from .lexer import TokenType, tokenize
+from .parser import Parser, parse
 
 
 class ReturnSignal(Exception):
@@ -74,6 +78,9 @@ class Frame:
         "owner_class",
         "owner_instance",
         "generator",
+        "escritura_aislada",
+        "dict_globals",
+        "dict_locals",
     )
 
     def __init__(
@@ -96,6 +103,17 @@ class Frame:
         self.owner_instance: Optional[CruthonInstance] = None
         #: El generador que está ejecutando este marco, si lo hay.
         self.generator: Optional["CruthonGenerator"] = None
+        #: ``True`` en los marcos de ``exec``: alli las asignaciones van a
+        #: los globales y no a los locales de la función que las rodea, como
+        #: en Python.
+        self.escritura_aislada = False
+        #: El diccionario pasado a ``exec(codigo, globals)`` o a
+        #: ``eval(expr, globals)``, si lo hubo: es el ámbito global de ese
+        #: código, como en Python.
+        self.dict_globals: Optional[Dict[str, Any]] = None
+        #: El diccionario pasado como ``locals`` a ``exec``/``eval``: ahí
+        #: van las escrituras de ese código.
+        self.dict_locals: Optional[Dict[str, Any]] = None
 
 
 class CruthonFunction:
@@ -120,7 +138,17 @@ class CruthonFunction:
         "interpreter",
         "owner_class",
         "is_generator",
+        "doc",
+        "__annotations__",
+        # Los valores por defecto de los parámetros, ya evaluados: como en
+        # Python, se evalúan al definir la función, no al llamarla.
+        "defaults_valorados",
+        # Como las funciones de Python, admiten atributos propios: un
+        # decorador puede colgarlesmetadata (``f.etiqueta = 'x'``).
+        "__dict__",
     )
+
+    __doc__ = _Docstring(__doc__)
 
     def __init__(
         self,
@@ -131,6 +159,8 @@ class CruthonFunction:
         closure: Optional["Frame"] = None,
         interpreter: Optional["Interpreter"] = None,
         owner_class: Optional[CruthonClass] = None,
+        doc: Optional[str] = None,
+        annotations: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.name = name
         self.args = args
@@ -142,14 +172,41 @@ class CruthonFunction:
         self.owner_class = owner_class
         #: ``True`` si el cuerpo tiene un ``yield``: la función es generadora.
         self.is_generator = _tiene_yield(body)
+        #: El docstring de la función, si su cuerpo empezaba con una cadena.
+        self.doc = doc
+        #: Las anotaciones de sus parámetros y de su retorno, ya evaluadas.
+        self.__annotations__ = annotations if annotations is not None else {}
+        #: Los valores por defecto de sus parámetros, ya evaluados.
+        self.defaults_valorados: Dict[str, Any] = {}
+
+    def _docstring_del_usuario(self) -> Optional[str]:
+        """El docstring de la función, como en Python (``f.__doc__``)."""
+        return self.doc
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.interpreter is None:  # pragma: no cover - defensivo
             raise CruthonRuntimeError(f"la función {self.name!r} no tiene intérprete")
         return self.interpreter.call_function(self, list(args), dict(kwargs))
 
+    @property
+    def __name__(self) -> str:
+        """El nombre de la función, como en Python."""
+        return self.name
+
+    @__name__.setter
+    def __name__(self, valor: str) -> None:
+        """Como en Python, ``f.__name__`` se puede cambiar (un decorador lo
+        hace a menudo para conservar el nombre original)."""
+        self.name = valor
+
     def __repr__(self) -> str:
-        return f"<func {self.name}>"
+        # Como en Python: ``<function f>``, y ``<function C.m>`` para un
+        # método. Sin la dirección de memoria, para que la salida sea
+        # reproducible.
+        nombre = self.name
+        if self.owner_class is not None:
+            nombre = f"{self.owner_class.nombre}.{nombre}"
+        return f"<function {nombre}>"
 
 
 def _tiene_yield(body: List[Any]) -> bool:
@@ -181,6 +238,48 @@ class _Fin:
     __slots__ = ()
 
 
+class _Cerrar:
+    """Señal de cierre: el generador debe desenrollarse."""
+
+    __slots__ = ()
+
+
+class _CerrarGenerador(Exception):
+    """Se lanza dentro del hilo del generador para desenrollarlo."""
+
+    def __init__(self) -> None:
+        super().__init__("close")
+
+
+class CruthonGenexp:
+    """Expresión generadora (``(x for x in xs)``).
+
+    Envuelve al generador de Python que la implementa para que se comporte
+    como el de CPython: se puede iterar, enviarle valores con ``send``,
+    cerrarlo con ``close`` y su ``repr`` es la de Python.
+    """
+
+    __slots__ = ("_generador",)
+
+    def __init__(self, generador: Any) -> None:
+        self._generador = generador
+
+    def __iter__(self) -> "CruthonGenexp":
+        return self
+
+    def __next__(self) -> Any:
+        return next(self._generador)
+
+    def send(self, valor: Any) -> Any:
+        return self._generador.send(valor)
+
+    def close(self) -> None:
+        self._generador.close()
+
+    def __repr__(self) -> str:
+        return f"<generator object <genexpr> at 0x{id(self):x}>"
+
+
 class CruthonGenerator:
     """Generador de Cruthon: el cuerpo se ejecuta en un hilo aparte.
 
@@ -210,6 +309,8 @@ class CruthonGenerator:
         self._error: Optional[BaseException] = None
         self._retorno: Any = None
         self._terminado = False
+        #: ``True`` hasta que el generador produzca su primer valor.
+        self._primer = True
         self._hilo = threading.Thread(target=self._correr, daemon=True)
         self._hilo.start()
 
@@ -228,31 +329,74 @@ class CruthonGenerator:
         finally:
             self._valores.put(_Fin())
 
-    def emitir(self, valor: Any) -> None:
-        """Entrega un valor y espera a que el consumidor pida el siguiente."""
+    def emitir(self, valor: Any) -> Any:
+        """Entrega un valor y espera a que el consumidor pida el siguiente.
+
+        Devuelve lo que el consumidor haya enviado (``None`` con ``next``,
+        el valor de ``send``). Así ``x = yield 1`` recibe el valor enviado.
+        """
         self._valores.put(valor)
-        self._peticiones.get()
+        enviado = self._peticiones.get()
+        if enviado is _Cerrar:
+            raise _CerrarGenerador()
+        return enviado
 
     def __iter__(self) -> "CruthonGenerator":
         return self
 
     def __next__(self) -> Any:
+        return self._avanzar(None, es_envio=False)
+
+    def send(self, valor: Any) -> Any:
+        """Envía un valor al generador, como en Python."""
         if self._terminado:
-            raise StopIteration(self._retorno)
+            raise self._stop_iteration()
+        return self._avanzar(valor, es_envio=True)
+
+    def _stop_iteration(self) -> StopIteration:
+        """La ``StopIteration`` que cierra el generador, como en Python.
+
+        En Python, un generador que termina sin valor devuelveraises
+        ``StopIteration()`` sin argumentos: ``str()`` de esa excepción es la
+        cadena vacía. Sólo si el generador devuelve un valor, ese valor
+        viaja en la excepción.
+        """
+        if self._retorno is None:
+            return StopIteration()
+        return StopIteration(self._retorno)
+
+    def _avanzar(self, enviado: Any, es_envio: bool) -> Any:
+        """Reanuda el generador con ``enviado`` y devuelve el valor siguiente.
+
+        El orden importa: primero se entrega el valor al generador (que está
+        suspendido en su ``yield``) y luego se espera el valor que produce.
+        Así ``send`` se comporta como en Python: lo que se envía es el valor
+        que toma la expresión ``yield``.
+
+        La excepción es la primera llamada con ``next``: un ``next`` sobre un
+        generador recién creado lo deja suspendido en su primer ``yield`` sin
+        tomarlo (``x = yield 1`` todavía no tiene valor). Un ``send`` sí lo
+        reanuda, porque en Python el valor enviado es lo que toma ese
+        ``yield``.
+        """
+        if self._terminado:
+            raise self._stop_iteration()
+        if not (self._primer and not es_envio):
+            self._peticiones.put(enviado)
         item = self._valores.get()
         if isinstance(item, _Fin):
             self._terminado = True
             if self._error is not None:
                 error, self._error = self._error, None
                 raise error
-            raise StopIteration(self._retorno)
-        self._peticiones.put(True)
+            raise self._stop_iteration()
+        self._primer = False
         return item
 
     def close(self) -> None:
         """Cierra el generador: el hilo que lo ejecuta termina."""
         self._terminado = True
-        self._peticiones.put(True)
+        self._peticiones.put(_Cerrar)
         self._hilo.join(timeout=1.0)
 
 
@@ -281,6 +425,24 @@ _COMPARE_OPS = {
     "!=": operator.ne,
 }
 
+#: El método in-place de cada operador de asignación aumentada: ``x += y``
+#: llama primero a ``__iadd__``, si el objeto lo define.
+_AUG_ASSIGN_METODOS = {
+    "+": "__iadd__",
+    "-": "__isub__",
+    "*": "__imul__",
+    "/": "__itruediv__",
+    "//": "__ifloordiv__",
+    "%": "__imod__",
+    "**": "__ipow__",
+    "&": "__iand__",
+    "|": "__ior__",
+    "^": "__ixor__",
+    "<<": "__ilshift__",
+    ">>": "__irshift__",
+    "@": "__imatmul__",
+}
+
 
 class Interpreter:
     """Evalúa un módulo de Cruthon."""
@@ -292,10 +454,15 @@ class Interpreter:
         #: La excepción que se está manejando ahora mismo (para ``raise``
         #: a secas).
         self.excepcion_actual: Optional[BaseException] = None
+        #: El docstring del módulo en ejecución (su ``__doc__``).
+        self.doc_modulo: Optional[str] = None
 
     # -- programa -------------------------------------------------------
     def run(self, module: N.Module) -> Any:
         """Ejecuta un módulo y devuelve el valor de su última expresión."""
+        if module.doc is not None:
+            # El docstring del módulo es su ``__doc__``, como en Python.
+            self.doc_modulo = module.doc
         return self.exec_block(module.body, self.globals, None)
 
     def exec_block(self, body: List[Any], blob: Blob, frame: Optional[Frame]) -> Any:
@@ -325,8 +492,51 @@ class Interpreter:
     def _exec_aug_assign(self, node, blob, frame):
         current = self.eval(node.target, blob, frame)
         operand = self.eval(node.value, blob, frame)
-        value = _BIN_OPS[node.op](current, operand)
+        value = self._operador_aumentado(node.op, current, operand)
         self.assign(node.target, value, blob, frame)
+        return None
+
+    def _operador_aumentado(self, op: str, actual: Any, operando: Any) -> Any:
+        """Calcula el valor de ``x += y`` (y de los demás ``+=``).
+
+        Como en Python, manda el operador *in-place*: si el objeto define
+        ``__iadd__`` (o ``__imul__``, ``__isub__``...) ese método es el que
+        calcula el resultado. Sólo si no lo define, o si devuelve
+        ``NotImplemented``, se usa el operador normal (``__add__``) y el
+        resultado se asigna después.
+        """
+        nombre = _AUG_ASSIGN_METODOS.get(op)
+        if nombre is not None:
+            metodo = self._metodo_especial(actual, nombre)
+            if metodo is not None:
+                resultado = metodo(operando)
+                if resultado is not NotImplemented:
+                    return resultado
+        return _BIN_OPS[op](actual, operando)
+
+    def _exec_ann_assign(self, node, blob, frame):
+        """Ejecuta ``x: int = 5``: anota y asigna.
+
+        La anotación se evalúa siempre (por si tiene efectos secundarios) y,
+        en el cuerpo de una clase, se guarda en ``__annotations__``, como en
+        Python.
+        """
+        annotation = self.eval(node.annotation, blob, frame)
+        nombre = node.target.id if isinstance(node.target, N.Name) else None
+        if nombre is not None:
+            if frame is not None and frame.is_class_body:
+                anotaciones = frame.locals.setdefault("__annotations__", {})
+                anotaciones[nombre] = annotation
+            elif frame is None:
+                ref = blob.lookup("__annotations__")
+                if ref is None:
+                    anotaciones = {}
+                    blob.define("__annotations__", anotaciones)
+                else:
+                    anotaciones = ref.get()
+                anotaciones[nombre] = annotation
+        if node.value is not None:
+            self.assign(node.target, self.eval(node.value, blob, frame), blob, frame)
         return None
 
     def _exec_blob_decl(self, node, blob, frame):
@@ -352,7 +562,18 @@ class Interpreter:
     def _exec_func_def(self, node, blob, frame):
         owner_class = frame.owner_class if frame is not None else None
         function = CruthonFunction(
-            node.name, node.args, node.body, blob, frame, self, owner_class
+            node.name,
+            node.args,
+            node.body,
+            blob,
+            frame,
+            self,
+            owner_class,
+            doc=node.doc,
+            annotations=self._anotaciones_de(node, blob, frame),
+        )
+        function.defaults_valorados = self._valores_por_defecto(
+            node.args, blob, frame
         )
         if frame is not None and frame.is_class_body:
             # Un método no cierra sobre el cuerpo de la clase: en Python,
@@ -367,10 +588,48 @@ class Interpreter:
         if frame is not None:
             # Como en Python, una función definida dentro de otra es una
             # variable local de la que la define (y la puede cerrar).
-            frame.locals[node.name] = function
+            self._bind(node.name, function, blob, frame)
         else:
             blob.define(node.name, function)
         return None
+
+    def _valores_por_defecto(self, spec, blob, frame) -> Dict[str, Any]:
+        """Los valores por defecto de los parámetros, ya evaluados.
+
+        Como en Python, se evalúan al *definir* la función y no al llamarla:
+        ``def f(x=[])`` comparte la misma lista entre todas las llamadas, y
+        ``def f(x=now())`` llama a ``now()`` una sola vez.
+        """
+        valores: Dict[str, Any] = {}
+        if spec.defaults:
+            for arg, default in zip(
+                spec.args[len(spec.args) - len(spec.defaults) :], spec.defaults
+            ):
+                valores[arg.name] = self.eval(default, blob, frame)
+        for arg in spec.kwonlyargs:
+            if arg.default is not None:
+                valores[arg.name] = self.eval(arg.default, blob, frame)
+        return valores
+
+    def _anotaciones_de(self, node, blob, frame) -> Dict[str, Any]:
+        """Las anotaciones de una función, ya evaluadas.
+
+        Como en Python, las anotaciones se evalúan al *definir* la función
+        (no al llamarla) y quedan en ``f.__annotations__``: las de cada
+        parámetro por su nombre y la del retorno bajo la clave ``"return"``.
+        """
+        spec = node.args
+        anotaciones: Dict[str, Any] = {}
+        for arg in list(spec.args) + list(spec.kwonlyargs):
+            if arg.annotation is not None:
+                anotaciones[arg.name] = self.eval(arg.annotation, blob, frame)
+        if spec.vararg is not None and spec.vararg_annotation is not None:
+            anotaciones[spec.vararg] = self.eval(spec.vararg_annotation, blob, frame)
+        if spec.kwarg is not None and spec.kwarg_annotation is not None:
+            anotaciones[spec.kwarg] = self.eval(spec.kwarg_annotation, blob, frame)
+        if node.returns is not None:
+            anotaciones["return"] = self.eval(node.returns, blob, frame)
+        return anotaciones
 
     def _aplicar_decorador(self, node, objetivo: Any, blob: Blob, frame: Optional[Frame]) -> Any:
         """Aplica un decorador: ``decorador(objetivo)``."""
@@ -389,6 +648,11 @@ class Interpreter:
             base = self.eval(base_node, blob, frame)
             if isinstance(base, CruthonClass):
                 bases.append(base)
+                # Si la clase base se apoya en un tipo de Python
+                # (``class A(list):``), la que hereda de ella también.
+                for base_py in base.bases_py:
+                    if base_py not in bases_py:
+                        bases_py.append(base_py)
             elif isinstance(base, type):
                 # Herencia de un tipo de Python (``class M(list):``): la
                 # clase se apoya en el comportamiento del tipo nativo.
@@ -401,6 +665,8 @@ class Interpreter:
         namespace: Dict[str, Any] = {
             "__name__": node.name,
             "__qualname__": node.name,
+            # El docstring de la clase, como en Python.
+            "__doc__": node.doc,
         }
         clase = CruthonClass(node.name, bases, namespace, blob, bases_py)
         # El cuerpo de la clase se ejecuta en su propio espacio de nombres,
@@ -494,6 +760,22 @@ class Interpreter:
                 raise CruthonRuntimeError("no hay ninguna excepción activa que relanzar")
             raise self.excepcion_actual
         excepcion = self.eval(node.exc, blob, frame)
+        if isinstance(excepcion, CruthonInstance):
+            # Una clase que hereda de una excepción de Python
+            # (``class E(ValueError):``) se apoya en una excepción nativa:
+            # la que se lanza es esa, para que ``except ValueError`` la
+            # capture como en Python.
+            base = excepcion.base_obj
+            if isinstance(base, BaseException):
+                try:
+                    object.__setattr__(base, "__cruthon_clase__", excepcion.clase)
+                except Exception:  # pragma: no cover - algunas excepciones no lo admiten
+                    pass
+                excepcion = base
+        elif isinstance(excepcion, type) and issubclass(excepcion, BaseException):
+            # ``raise StopIteration`` (sin paréntesis) lanza la clase, y
+            # Python la instancia sola.
+            excepcion = excepcion()
         if not isinstance(excepcion, BaseException):
             raise CruthonRuntimeError(
                 "las excepciones deben derivar de BaseException, no de "
@@ -556,7 +838,17 @@ class Interpreter:
     def _exec_import(self, node, blob, frame):
         for alias in node.names:
             module = importlib.import_module(alias.name)
-            name = alias.asname or alias.name.split(".")[0]
+            if alias.asname:
+                name = alias.asname
+            elif "." in alias.name:
+                # ``import a.b`` enlaza el paquete de primer nivel, como en
+                # Python: ``a`` queda bound al paquete, y ``a.b`` sigue
+                # siendo accesible porque el sub-módulo queda como atributo
+                # del paquete.
+                name = alias.name.split(".")[0]
+                module = importlib.import_module(name)
+            else:
+                name = alias.name
             self._bind(name, module, blob, frame)
         return None
 
@@ -644,6 +936,13 @@ class Interpreter:
         cualquiera de los dos; una tupla de tipos no es un ``type``, así que
         no se puede pasar tal cual a ``isinstance``.
         """
+        if isinstance(esperado, CruthonClass):
+            # Una clase de Cruthon que hereda de una excepción de Python:
+            # la excepción nativa lleva el rastro de su clase.
+            clase = getattr(error, "__cruthon_clase__", None)
+            if clase is None:
+                return False
+            return any(candidata is esperado for candidata in clase.mro)
         if isinstance(esperado, tuple):
             return any(
                 isinstance(candidato, type) and isinstance(error, candidato)
@@ -681,6 +980,10 @@ class Interpreter:
                     self.excepcion_actual = anterior
                 if not handled:
                     raise
+            else:
+                # La rama ``else`` de un ``try`` se ejecuta sólo cuando el
+                # cuerpo no lanzó ninguna excepción, como en Python.
+                self.exec_block(node.orelse, blob, frame)
         finally:
             if node.finalbody:
                 self.exec_block(node.finalbody, blob, frame)
@@ -690,6 +993,7 @@ class Interpreter:
         N.ExprStmt: _exec_expr_stmt,
         N.Assign: _exec_assign,
         N.AugAssign: _exec_aug_assign,
+        N.AnnAssign: _exec_ann_assign,
         N.BlobDecl: _exec_blob_decl,
         N.FuncDef: _exec_func_def,
         N.ClassDef: _exec_class_def,
@@ -713,8 +1017,24 @@ class Interpreter:
 
     # -- asignación -----------------------------------------------------
     def _bind(self, name: str, value: Any, blob: Blob, frame: Optional[Frame]) -> None:
-        """Enlaza un nombre en el ámbito actual (función local o miembro del blob)."""
-        if frame is not None and name not in frame.globals:
+        """Enlaza un nombre en el ámbito actual (función local o miembro del blob).
+
+        En un ``exec``/``eval`` con diccionario propio, el nombre va al
+        diccionario, como en Python.
+        """
+        if frame is not None:
+            if name in frame.globals:
+                if frame.dict_globals is not None:
+                    frame.dict_globals[name] = value
+                    return
+                blob.define(name, value)
+                return
+            if frame.dict_locals is not None:
+                frame.dict_locals[name] = value
+                return
+            if frame.dict_globals is not None:
+                frame.dict_globals[name] = value
+                return
             frame.locals[name] = value
             return
         blob.define(name, value)
@@ -773,7 +1093,13 @@ class Interpreter:
         """Asigna un nombre simple respetando las reglas de ámbito por conjuntos."""
         if frame is not None:
             if name in frame.globals:
-                self.assign_name_in(self.globals, name, value)
+                if frame.dict_globals is not None:
+                    # ``global x`` dentro de un ``exec`` con diccionario:
+                    # la escritura va al diccionario de globales, como en
+                    # Python.
+                    frame.dict_globals[name] = value
+                else:
+                    self.assign_name_in(self.globals, name, value)
                 return
             if name in frame.nonlocals:
                 # ``nonlocal``: la escritura va al marco externo que lo declara.
@@ -788,10 +1114,25 @@ class Interpreter:
                 # nombres de la clase, como en Python.
                 frame.locals[name] = value
                 return
+            if frame.dict_locals is not None or frame.dict_globals is not None:
+                # Un ``exec``/``eval`` con diccionario propio: la escritura
+                # va al diccionario, no al ámbito que lo rodea, como en
+                # Python.
+                destino = (
+                    frame.dict_locals if frame.dict_locals is not None else frame.dict_globals
+                )
+                destino[name] = value  # type: ignore[index]
+                return
             current = frame
             while current is not None:
                 if name in current.locals:
                     current.locals[name] = value
+                    return
+                if frame.escritura_aislada:
+                    # Un marco aislado (``exec``) no escribe ni en los
+                    # locales de la función que lo rodea ni en los globales:
+                    # sus nombres se pierden, como en Python.
+                    frame.locals[name] = value
                     return
                 current = current.parent
         ref = blob.lookup(name)
@@ -853,6 +1194,10 @@ class Interpreter:
     def lookup_name(self, name: str, blob: Blob, frame: Optional[Frame]) -> Any:
         current = frame
         while current is not None:
+            if current.dict_locals is not None and name in current.dict_locals:
+                return current.dict_locals[name]
+            if current.dict_globals is not None and name in current.dict_globals:
+                return current.dict_globals[name]
             if name in current.locals:
                 return current.locals[name]
             current = current.parent
@@ -867,12 +1212,112 @@ class Interpreter:
         ref = blob.lookup(name)
         if ref is not None:
             return ref.get()
+        if name == "globals":
+            # El "global" de Cruthon es el área del blob donde corre el
+            # código: sus miembros, y no los de los blobs hermanos. Como en
+            # Python, el diccionario incluye ``__name__`` y ``__doc__``.
+            def globals_() -> Dict[str, Any]:
+                espacio = {n: celda.value for n, celda in blob.storage.items()}
+                espacio.setdefault("__name__", blob.name)
+                espacio.setdefault("__doc__", self.doc_modulo)
+                return espacio
+
+            return globals_
+        if name == "locals":
+            # En una función, los locales son los de su marco; fuera de una
+            # función, el local es el propio blob.
+            if frame is not None:
+                return lambda: dict(frame.locals)
+            return lambda: {n: celda.value for n, celda in blob.storage.items()}
+        if name == "__name__":
+            # El nombre del módulo: en Cruthon, el del blob donde se ejecuta
+            # el código, que es su ámbito.
+            return blob.name
+        if name == "__doc__":
+            # El docstring del módulo, como en Python.
+            return self.doc_modulo
+        if name in ("eval", "exec"):
+            return self._builtin_de_codigo(name, blob, frame)
         if name in self.builtins:
             return self.builtins[name]
         raise NameNotFound(
             f"nombre no definido: {name!r} (no vive dentro del área del blob "
             f"'{blob.name}')"
         )
+
+    # -- builtins que dependen del ámbito --------------------------------
+    def _builtin_de_codigo(self, name: str, blob: Blob, frame: Optional[Frame]) -> Any:
+        """``eval`` y ``exec``: el código se evalúa donde se escribe.
+
+        A diferencia del resto de builtins, estos dos dependen del ámbito
+        del punto de llamada: el código se evalúa en el blob y el marco
+        donde aparecen, no en un ámbito global cualquiera.
+        """
+        if name == "eval":
+
+            def eval_(source: Any, globals: Any = None, locals: Any = None) -> Any:
+                """Evalúa una expresión de Cruthon en el ámbito actual."""
+                marco = self._marco_de(globals, locals, blob, frame)
+                return self.eval(self._expresion_de(source), blob, marco)
+
+            return eval_
+
+        def exec_(source: Any, globals: Any = None, locals: Any = None) -> Any:
+            """Ejecuta código de Cruthon en el ámbito actual."""
+            marco = self._marco_de(globals, locals, blob, frame)
+            if marco is frame and frame is not None:
+                # Como en Python, ``exec`` dentro de una función no añade
+                # nombres a sus locales: el código corre en un marco aparte,
+                # aunque sí ve los locales de la función.
+                marco = Frame(blob=blob, parent=frame)
+                marco.escritura_aislada = True
+            self.exec_block(self._modulo_de(source).body, blob, marco)
+            return None
+
+        return exec_
+
+    def _marco_de(
+        self, globals: Any, locals: Any, blob: Blob, frame: Optional[Frame]
+    ) -> Optional[Frame]:
+        """El marco en el que se evalúa ``eval``/``exec``.
+
+        Sin ``globals`` ni ``locals`` es el marco de la llamada. Con ellos,
+        un marco nuevo que usa los diccionarios dados como su ámbito, como
+        en Python: en ``exec(codigo, g)`` las escrituras van a ``g`` y en
+        ``exec(codigo, g, l)`` van a ``l``; las lecturas miran primero ``l``
+        y después ``g``.
+        """
+        if globals is None and locals is None:
+            return frame
+        marco = Frame(blob=blob, parent=frame)
+        if isinstance(globals, dict):
+            marco.dict_globals = globals
+        if isinstance(locals, dict):
+            marco.dict_locals = locals
+        elif isinstance(globals, dict):
+            # ``exec(codigo, g)``: el mismo diccionario es el ámbito global
+            # y el local, como en Python.
+            marco.dict_locals = globals
+        return marco
+
+    def _expresion_de(self, source: Any) -> Any:
+        """Analiza el texto de una expresión, para ``eval``."""
+        if not isinstance(source, str):
+            raise TypeError("eval() espera una cadena")
+        parser = Parser(tokenize(source, "<eval>"), "<eval>")
+        nodo = parser.parse_test()
+        token = parser.peek()
+        if token.type not in (TokenType.NEWLINE, TokenType.ENDMARKER):
+            raise CruthonSyntaxError(
+                "eval() sólo admite una expresión", "<eval>", token.lineno
+            )
+        return nodo
+
+    def _modulo_de(self, source: Any) -> N.Module:
+        """Analiza el texto de un módulo, para ``exec``."""
+        if not isinstance(source, str):
+            raise TypeError("exec() espera una cadena")
+        return parse(source, "<exec>")
 
     def _eval_attribute(self, node, blob, frame):
         obj = self.eval(node.value, blob, frame)
@@ -972,7 +1417,22 @@ class Interpreter:
             # Una función generadora no se ejecuta al llamarla: devuelve el
             # generador, que va avanzando bajo demanda.
             return CruthonGenerator(self, function, args, kwargs)
-        return self._ejecutar_funcion(function, args, kwargs)
+        owner_class = function.owner_class
+        owner_instance = None
+        if owner_class is not None and args:
+            # Un descriptor (una ``property``) llama a su función con la
+            # instancia como primer argumento: esa instancia es la del
+            # método en curso, y es lo que ``super()`` necesita.
+            candidato = args[0]
+            if isinstance(candidato, CruthonInstance):
+                owner_instance = candidato
+        return self._ejecutar_funcion(
+            function,
+            args,
+            kwargs,
+            owner_class=owner_class,
+            owner_instance=owner_instance,
+        )
 
     def _ejecutar_funcion(
         self,
@@ -993,32 +1453,52 @@ class Interpreter:
         spec = function.args
         names = [arg.name for arg in spec.args]
         if len(args) > len(names) and spec.vararg is None:
-            raise CruthonRuntimeError(
-                f"la función {function.name!r} acepta {len(names)} argumentos "
-                f"y recibió {len(args)}"
+            raise CruthonTypeError(
+                f"{function.name}() takes {len(names)} positional "
+                f"argument{'' if len(names) == 1 else 's'} but {len(args)} "
+                "were given"
             )
+        # Los valores por defecto se alinean con los últimos parámetros,
+        # como en Python: ``def f(a, b=1)`` da ``b`` el valor por defecto.
+        por_defecto: Dict[str, Any] = {}
+        if spec.defaults:
+            for arg, default in zip(
+                spec.args[len(spec.args) - len(spec.defaults) :], spec.defaults
+            ):
+                por_defecto[arg.name] = default
+        faltantes: List[str] = []
         for index, name in enumerate(names):
             if index < len(args):
                 frame.locals[name] = args[index]
             elif name in kwargs:
-                frame.locals[name] = kwargs.pop(name)
-            else:
-                default_index = index - (len(names) - len(spec.defaults))
-                if default_index < 0:
-                    raise CruthonRuntimeError(
-                        f"falta el argumento '{name}' de {function.name!r}"
+                if spec.args[index].posonly:
+                    # Un parámetro sólo posicional no se puede pasar por
+                    # palabra clave, como en Python.
+                    raise CruthonTypeError(
+                        f"{function.name}() got some positional-only arguments "
+                        f"passed as keyword arguments: '{name}'"
                     )
-                frame.locals[name] = self.eval(spec.defaults[default_index], function.blob, None)
+                frame.locals[name] = kwargs.pop(name)
+            elif name in por_defecto:
+                frame.locals[name] = function.defaults_valorados[name]
+            else:
+                faltantes.append(name)
+        if faltantes:
+            raise CruthonTypeError(
+                self._mensaje_de_faltantes(function.name, "positional", faltantes)
+            )
         if spec.vararg:
             frame.locals[spec.vararg] = tuple(args[len(names) :])
         for arg in spec.kwonlyargs:
             if arg.name in kwargs:
                 frame.locals[arg.name] = kwargs.pop(arg.name)
             elif arg.default is not None:
-                frame.locals[arg.name] = self.eval(arg.default, function.blob, None)
+                frame.locals[arg.name] = function.defaults_valorados[arg.name]
             else:
-                raise CruthonRuntimeError(
-                    f"falta el argumento '{arg.name}' de {function.name!r}"
+                raise CruthonTypeError(
+                    self._mensaje_de_faltantes(
+                        function.name, "keyword-only", [arg.name]
+                    )
                 )
         if spec.kwarg:
             # ``**kwargs``: los argumentos sobrantes se recogen en un
@@ -1027,14 +1507,32 @@ class Interpreter:
         else:
             for name in kwargs:
                 if name not in frame.locals:
-                    raise CruthonRuntimeError(
-                        f"argumento inesperado '{name}' para {function.name!r}"
+                    raise CruthonTypeError(
+                        f"{function.name}() got an unexpected keyword argument "
+                        f"'{name}'"
                     )
         try:
             self.exec_block(function.body, function.blob, frame)
         except ReturnSignal as signal:
             return signal.value
         return None
+
+    @staticmethod
+    def _mensaje_de_faltantes(
+        nombre: str, clase: str, faltantes: List[str]
+    ) -> str:
+        """El mensaje de error de los argumentos que faltan, como en CPython.
+
+        ``f() missing 1 required positional argument: 'a'`` y
+        ``f() missing 2 required positional arguments: 'a' and 'b'``.
+        """
+        if len(faltantes) == 1:
+            return (
+                f"{nombre}() missing 1 required {clase} argument: "
+                f"'{faltantes[0]}'"
+            )
+        nombres = " and ".join(f"'{falta}'" for falta in faltantes)
+        return f"{nombre}() missing {len(faltantes)} required {clase} arguments: {nombres}"
 
     def _eval_binop(self, node, blob, frame):
         left = self.eval(node.left, blob, frame)
@@ -1174,6 +1672,10 @@ class Interpreter:
         return result
 
     def _eval_generator(self, node, blob, frame):
+        """Evalúa una expresión generadora y devuelve su generador."""
+        return CruthonGenexp(self._iterar_generador(node, blob, frame))
+
+    def _iterar_generador(self, node, blob, frame):
         for generators, _ in self._iterate_comprehension(node.generators, blob, frame):
             yield self.eval(node.elt, blob, generators)
 
@@ -1201,7 +1703,11 @@ class Interpreter:
             kwarg=spec.kwarg, defaults=spec.defaults,
         )
         body = [N.Return(value=node.body)]
-        return CruthonFunction("<lambda>", arguments, body, blob, None, self)
+        function = CruthonFunction("<lambda>", arguments, body, blob, None, self)
+        # Los valores por defecto se evalúan al crear el ``lambda``, como
+        # en Python: ``lambda x=[]: x`` comparte la misma lista.
+        function.defaults_valorados = self._valores_por_defecto(arguments, blob, frame)
+        return function
 
     def _eval_namedexpr(self, node, blob, frame):
         """Evalúa ``(x := valor)``: asigna y devuelve el valor."""
@@ -1221,8 +1727,9 @@ class Interpreter:
                 generador.emitir(item)
             return None
         value = None if node.value is None else self.eval(node.value, blob, frame)
-        generador.emitir(value)
-        return None
+        # Lo que el consumidor envíe vuelve como valor de la expresión
+        # ``yield``: ``x = yield 1`` recibe lo que se le manda.
+        return generador.emitir(value)
 
     def _eval_joinedstr(self, node, blob, frame):
         pieces = []
@@ -1240,8 +1747,14 @@ class Interpreter:
             value = ascii(value)
         if node.format_spec is not None:
             spec = self.eval(node.format_spec, blob, frame)
-            return format(value, spec)
-        return str(value)
+            value = format(value, spec)
+        else:
+            value = str(value)
+        if node.debug:
+            # ``f"{x=}"``: el texto de la expresión, el ``=`` y el valor,
+            # como en Python.
+            return node.debug + value
+        return value
 
     _EXPRESSIONS = {
         N.Constant: _eval_constant,

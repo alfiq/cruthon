@@ -67,7 +67,7 @@ def run_source(source: str, filename: str, show_membership: bool = False) -> int
         module = parse(source, filename)
     except CruthonSyntaxError as error:
         print(f'  File "{filename}", line {error.lineno}', file=sys.stderr)
-        print(f"    {error.message}", file=sys.stderr)
+        print(f"SyntaxError: {error.message}", file=sys.stderr)
         return 1
     interpreter = Interpreter(filename)
     try:

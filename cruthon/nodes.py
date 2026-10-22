@@ -161,6 +161,8 @@ class FormattedValue(Node):
     value: Any = None
     conversion: Optional[str] = None
     format_spec: Optional[str] = None
+    #: El texto del marcador de depuración (``f"{x=}"``), si lo hay.
+    debug: Optional[str] = None
 
 
 @dataclass
@@ -188,6 +190,8 @@ class JoinedStr(Node):
 @dataclass
 class Module(Node):
     body: ListType[Any] = field(default_factory=list)
+    #: El docstring del módulo, si su primera sentencia es una cadena.
+    doc: Optional[str] = None
 
 
 @dataclass
@@ -209,6 +213,15 @@ class AugAssign(Node):
 
 
 @dataclass
+class AnnAssign(Node):
+    """Asignación anotada: ``x: int = 5``."""
+
+    target: Any = None
+    annotation: Any = None
+    value: Any = None
+
+
+@dataclass
 class BlobDecl(Node):
     """``blob nombre:`` o ``blob nombre = a & b:``."""
 
@@ -224,6 +237,10 @@ class FuncDef(Node):
     body: ListType[Any] = field(default_factory=list)
     #: Los decoradores, en el orden en que se escribieron (``@arriba`` primero).
     decorators: ListType[Any] = field(default_factory=list)
+    #: La anotación de retorno (``def f() -> int``), si la hay.
+    returns: Any = None
+    #: El docstring de la función, si su cuerpo empieza con una cadena.
+    doc: Optional[str] = None
 
 
 @dataclass
@@ -235,12 +252,19 @@ class ClassDef(Node):
     body: ListType[Any] = field(default_factory=list)
     #: Los decoradores, en el orden en que se escribieron.
     decorators: ListType[Any] = field(default_factory=list)
+    #: El docstring de la clase, si su cuerpo empieza con una cadena.
+    doc: Optional[str] = None
 
 
 @dataclass
 class Arg(Node):
     name: str = ""
     default: Any = None
+    #: La anotación del parámetro (``def f(x: int)``), si la hay.
+    annotation: Any = None
+    #: Si el parámetro es sólo posicional (``def f(x, /, y)``): no se puede
+    #: pasar por palabra clave, como en Python.
+    posonly: bool = False
 
 
 @dataclass
@@ -250,6 +274,10 @@ class Arguments(Node):
     kwonlyargs: ListType[Any] = field(default_factory=list)
     kwarg: Optional[str] = None
     defaults: ListType[Any] = field(default_factory=list)
+    #: La anotación de ``*args`` (``def f(*args: int)``), si la hay.
+    vararg_annotation: Any = None
+    #: La anotación de ``**kwargs`` (``def f(**kw: int)``), si la hay.
+    kwarg_annotation: Any = None
 
 
 @dataclass

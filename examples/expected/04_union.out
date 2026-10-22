@@ -1,4 +1,4 @@
 sesión iniciada
 [métrica] inicio_sesion
-monitoreo ve registrar = <func registrar>
-monitoreo ve contar_evento = <func contar_evento>
+monitoreo ve registrar = <function registrar>
+monitoreo ve contar_evento = <function contar_evento>

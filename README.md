@@ -154,7 +154,9 @@ print(c.sumar(5))          # 15
 
 Hay herencia, `super()`, decoradores (`@property`, `@classmethod`,
 `@staticmethod` y los propios) y los métodos especiales de Python
-(`__init__`, `__len__`, `__getitem__`, `__iter__`, `__eq__`…). También se
+(`__init__`, `__len__`, `__getitem__`, `__iter__`, `__next__`, `__eq__`…). Una
+`property` con setter se comporta como en Python: la asignación pasa por el
+setter y no se guarda como un atributo más de la instancia. También se
 pueden heredar tipos de Python: la instancia se apoya entonces en un objeto
 nativo.
 
@@ -229,6 +231,11 @@ una clase y una clase no es un blob.
   donde se *define*, pero hereda el global; aquí el ámbito es el blob, y el
   de quien llama no se mezcla. Esto también afecta a los métodos: un método
   se ejecuta con el ámbito del blob donde se definió la clase.
+* **La escritura.** Como el ámbito de una función *es* el blob donde está
+  definida, ahí escribe: `total += precio` dentro de una función del blob
+  actualiza el `total` del blob, y no crea una variable local como en
+  Python. Los nombres que no viven en el blob sí son locales de la función,
+  y `global` y `nonlocal` siguen funcionando como en Python.
 * **El error de alcance.** Cuando un nombre no vive dentro del área del blob
   activo, Cruthon lanza `ScopeError` (un `RuntimeError`) en vez de un
   `AttributeError` o un `NameError`. El nombre existe en el programa, pero
@@ -245,6 +252,9 @@ una clase y una clase no es un blob.
   *builtins* está disponible dentro de un blob (la lista está en
   [`cruthon/builtins.py`](cruthon/builtins.py)); lo que no está, no se ve.
 * No hay `async`/`await` ni `match`.
+* Una clase de Cruthon no es un tipo de Python: los decoradores de la
+  biblioteca estándar que exigen una clase de verdad (`@dataclasses.dataclass`,
+  `class E(enum.Enum)`) no se pueden aplicar a una clase de Cruthon.
 * El intérprete no genera bytecode: es un evaluador de árbol de sintaxis,
   como el de un intérprete pedagogy. La diferencia observable es el
   rendimiento, no la semántica.
@@ -253,14 +263,37 @@ una clase y una clase no es un blob.
 
 [`tests/test_paridad.py`](tests/test_paridad.py) ejecuta los mismos
 fragmentos en Cruthon y en CPython y compara la salida byte a byte. Cubre
-escapes de cadena, f-strings, comprehensions (y expresiones generadoras),
+escapes de cadena, f-strings (con formato, con conversión y con el marcador
+de depuración `f"{x=}"`), comprehensions (y expresiones generadoras),
 `del`, `global`, `nonlocal`, closures, `*args`/`**kwargs`, argumentos por
 palabra clave, slices, excepciones (`raise`, `except` con tupla, `finally`),
-`import` de la biblioteca estándar, las operaciones aritméticas, las clases
-(herencia, `super()`, `__init__`, `__len__`, `__eq__`, `__repr__`), los
-decoradores (`@property`, `@classmethod`, `@staticmethod`), los generadores
-(`yield`, `yield from`), el gestor de contexto (`with`, con uno y con varios
-gestores) y la herencia de tipos de Python (`class M(list):`).
+`import` de la biblioteca estándar, las operaciones aritméticas, los
+literales complejos y `Ellipsis`, la expansión `**` en diccionarios, las
+anotaciones de variable, las suites en una línea (`if x: y`, `def f(): ...`,
+`class A: pass`), las clases (herencia, `super()` y `super(B, self)`,
+`__init__`, `__len__`, `__eq__`, `__repr__`, iterador propio con `__iter__` y
+`__next__`), los decoradores (`@property`, `@classmethod`, `@staticmethod` y
+`@property` con setter), los generadores (`yield`, `yield from`), el gestor
+de contexto (`with`, con uno y con varios gestores) y la herencia de tipos de
+Python (`class M(list):`).
+
+También cubre el protocolo de métodos especiales escrito por el usuario
+(`__getattr__`, `__setattr__`, `__delattr__`, `__format__`, `__index__`,
+`__int__`, `__float__`, `__bytes__`, `__reversed__`, `__round__`,
+`__trunc__` y `__delitem__`), las reglas de llamada de Python (el `TypeError`
+cuando sobran argumentos, faltan o se pasan por un nombre que no existe, y
+los parámetros sólo posicionales, `def f(a, /, b)`), la introspección
+(`globals()`, `locals()`, `vars()`) y los errores de sintaxis que Python
+también rechaza (`yield` fuera de una función, dos `*` en el mismo nivel).
+
+Y además: los valores por defecto, que se evalúan al *definir* la función y
+no al llamarla (como en Python, `def f(x=[])` comparte la misma lista y
+`def f(x=ahora())` llama a `ahora()` una sola vez); los docstrings y las
+anotaciones de funciones, clases y métodos; el `eval` y el `exec` con
+diccionario propio, cuyas escrituras van a ese diccionario; el `SyntaxError`
+que esos dos builtins lanzan, capturable como `SyntaxError`; los atributos que
+se cuelgan de una función (`f.etiqueta = 'x'`); y el `StopIteration` con el
+que termina un generador.
 
 ## Arquitectura
 
@@ -301,7 +334,7 @@ python tools/run_examples.py --update   # regenera los resultados
 ## Pruebas
 
 ```bash
-python -m pytest            # 265 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos y PDF
+python -m pytest            # 457 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos y PDF
 ```
 
 ## El documento de diseño

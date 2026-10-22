@@ -16,8 +16,13 @@ class CruthonError(Exception):
     """Base de todos los errores de Cruthon."""
 
 
-class CruthonSyntaxError(CruthonError):
-    """Error de sintaxis o de sangrado."""
+class CruthonSyntaxError(CruthonError, SyntaxError):
+    """Error de sintaxis o de sangrado.
+
+    Hereda también de ``SyntaxError`` de Python: un ``except SyntaxError``
+    escrito en Python tiene que seguir capturando aquí, como hace con los
+    errores de sintaxis de CPython.
+    """
 
     def __init__(
         self,
@@ -27,12 +32,16 @@ class CruthonSyntaxError(CruthonError):
         colno: int = 0,
         text: Optional[str] = None,
     ) -> None:
+        super().__init__(message)
+        # ``SyntaxError.__init__`` reinicia estos atributos al construirse,
+        # así que se rellenan después.
         self.message = message
+        self.msg = message
         self.filename = filename
         self.lineno = lineno
         self.colno = colno
+        self.offset = colno
         self.text = text
-        super().__init__(self._format())
 
     def _format(self) -> str:
         head = f'File "{self.filename}", line {self.lineno}'
@@ -56,6 +65,16 @@ class CruthonRuntimeError(CruthonError):
     """Error en tiempo de ejecución."""
 
 
+class CruthonTypeError(CruthonRuntimeError, TypeError):
+    """Un ``TypeError`` de Python, que además es un error de Cruthon.
+
+    Se usa para los errores de llamada (argumentos que no cuadran) y para
+    los tipos que no admiten una operación, de modo que un
+    ``except TypeError`` escrito en Python siga capturando, como hace en
+    CPython.
+    """
+
+
 class ScopeError(CruthonRuntimeError):
     """El nombre pedido no vive dentro del área del blob activo.
 
@@ -64,8 +83,14 @@ class ScopeError(CruthonRuntimeError):
     """
 
 
-class NameNotFound(ScopeError):
-    """El nombre no existe en ninguna intersección alcanzable."""
+class NameNotFound(ScopeError, NameError):
+    """El nombre no existe en ninguna intersección alcanzable.
+
+    Hereda también del ``NameError`` de Python: en CPython, un nombre que
+    no está definido lanza ``NameError``, así que un ``except NameError``
+    escrito en Python tiene que seguir capturando aquí. ``ScopeError``
+    sigue siendo su ancestro: ``except ScopeError`` también lo captura.
+    """
 
 
 class BlobTypeError(CruthonRuntimeError):

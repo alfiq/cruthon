@@ -33,8 +33,10 @@ FUNCIONES: Dict[str, Any] = {
     "callable": python_builtins.callable,
     "chr": python_builtins.chr,
     "classmethod": python_builtins.classmethod,
+    "complex": python_builtins.complex,
     "dict": python_builtins.dict,
     "dir": python_builtins.dir,
+    "Ellipsis": python_builtins.Ellipsis,
     "divmod": python_builtins.divmod,
     "enumerate": python_builtins.enumerate,
     "filter": python_builtins.filter,
@@ -58,10 +60,12 @@ FUNCIONES: Dict[str, Any] = {
     "memoryview": python_builtins.memoryview,
     "min": python_builtins.min,
     "next": python_builtins.next,
+    "NotImplemented": python_builtins.NotImplemented,
     "object": python_builtins.object,
     "open": python_builtins.open,
     "oct": python_builtins.oct,
     "ord": python_builtins.ord,
+    "pow": python_builtins.pow,
     "print": python_builtins.print,
     "property": python_builtins.property,
     "range": python_builtins.range,
@@ -82,6 +86,11 @@ FUNCIONES: Dict[str, Any] = {
     "delattr": python_builtins.delattr,
 }
 
+#: Builtins que dependen del ámbito donde se usan: los resuelve el
+#: intérprete (``cruthon/interpreter.py``), porque ``eval`` y ``exec``
+#: necesitan el blob y el marco del punto de llamada, no un ámbito global.
+FUNCIONES_CON_AMBITO = ("eval", "exec")
+
 #: Excepciones de Python que se pueden capturar dentro de un blob.
 EXCEPCIONES: Dict[str, Any] = {
     nombre: getattr(python_builtins, nombre)
@@ -90,11 +99,13 @@ EXCEPCIONES: Dict[str, Any] = {
         "AssertionError",
         "AttributeError",
         "Exception",
+        "IndentationError",
         "IndexError",
         "KeyError",
         "NameError",
         "RuntimeError",
         "StopIteration",
+        "SyntaxError",
         "TypeError",
         "ValueError",
         "ZeroDivisionError",

@@ -13,6 +13,7 @@ lenguaje:
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from enum import Enum, auto
 from typing import List, Tuple
@@ -194,11 +195,11 @@ def split_fstring(raw: str) -> List[Tuple[str, object]]:
                 i += 2
                 continue
             j = _find_closing_brace(raw, i)
-            expr_src, conversion, spec = _split_expression(raw[i + 1 : j])
+            expr_src, conversion, spec, debug = _split_expression(raw[i + 1 : j])
             if buffer:
                 parts.append(("str", decode_escapes("".join(buffer))))
                 buffer = []
-            parts.append(("expr", (expr_src, conversion, spec)))
+            parts.append(("expr", (expr_src, conversion, spec, debug)))
             i = j + 1
             continue
         if ch == "}":
@@ -239,10 +240,15 @@ def _find_closing_brace(raw: str, start: int) -> int:
 
 
 def _split_expression(src: str):
-    """Separa ``expr``, ``!conversion`` y ``:spec`` de una expresión de f-string."""
+    """Separa ``expr``, ``!conversion``, ``:spec`` y ``=`` de una f-string.
+
+    El ``=`` es el *marcador de depuración* de Python 3.8: ``f"{x=}"``
+    escribe el texto de la expresión, un ``=`` y el valor.
+    """
     depth = 0
     conv = None
     spec = None
+    debug = None
     cut = len(src)
     i = 0
     n = len(src)
@@ -259,6 +265,15 @@ def _split_expression(src: str):
                 if src[i] == "\\":
                     i += 1
                 i += 1
+        elif depth == 0 and ch == "=" and not (i + 1 < n and src[i + 1] == "="):
+            # ¿Es el marcador de depuración? Sólo si lo que sigue es una
+            # conversión, un formato, o nada.
+            resto = src[i + 1 :]
+            cola = resto.lstrip()
+            if cola == "" or re.fullmatch(r"![sra]", cola) or cola.startswith(":"):
+                espacios = resto[: len(resto) - len(cola)]
+                debug = src[: i + 1] + espacios
+                cut = min(cut, i)
         elif depth == 0 and ch == "!" and i + 1 < n and src[i + 1] != "=":
             conv = src[i + 1]
             cut = min(cut, i)
@@ -266,7 +281,7 @@ def _split_expression(src: str):
             spec = src[i + 1 :]
             cut = min(cut, i)
         i += 1
-    return src[:cut].strip(), conv, spec
+    return src[:cut].strip(), conv, spec, debug
 
 
 class Lexer:
@@ -515,6 +530,17 @@ class Lexer:
                 while j < n and src[j] in _DIGITS:
                     j += 1
         text = src[i:j].replace("_", "")
+        if j < n and src[j] in "jJ":
+            # ``1j``: un literal complejo, como en Python. El número es el
+            # coeficiente de la parte imaginaria: ``1j`` es 0+1j.
+            j += 1
+            try:
+                self._emit(TokenType.NUMBER, complex(0, float(text)))
+            except ValueError:
+                raise CruthonSyntaxError(
+                    f"literal numérico inválido {text!r}", self.filename, self._lineno
+                ) from None
+            return j
         if is_float:
             self._emit(TokenType.NUMBER, float(text))
         else:

@@ -15,7 +15,13 @@ from typing import Any, List, Optional
 
 from . import nodes as N
 from .errors import CruthonSyntaxError, IncompleteInput
-from .lexer import Token, TokenType, decode_escapes, tokenize
+from .lexer import (
+    Token,
+    TokenType,
+    _find_closing_brace,
+    decode_escapes,
+    tokenize,
+)
 
 #: Operadores de asignación aumentada.
 AUG_ASSIGN_OPS = {
@@ -31,6 +37,7 @@ AUG_ASSIGN_OPS = {
     "^=": "^",
     "<<=": "<<",
     ">>=": ">>",
+    "@=": "@",
 }
 
 #: Operadores de comparación.
@@ -47,6 +54,9 @@ class Parser:
         self.tokens = tokens
         self.pos = 0
         self.filename = filename
+        #: Cuántas funciones se están analizando: un ``yield`` fuera de
+        #: ellas es un error de sintaxis, como en Python.
+        self.profundidad_de_funciones = 0
 
     # -- utilidades sobre el flujo de tokens ---------------------------
     def peek(self, offset: int = 0) -> Token:
@@ -105,7 +115,7 @@ class Parser:
                 self.advance()
                 continue
             body.extend(self.parse_statement())
-        return N.Module(body=body, lineno=1)
+        return N.Module(body=body, doc=self._docstring_de(body), lineno=1)
 
     # -- sentencias ----------------------------------------------------
     def parse_statement(self) -> List[Any]:
@@ -202,12 +212,35 @@ class Parser:
             # En Python, ``(x := 1)`` sólo vale como expresión: como
             # sentencia es un error de sintaxis.
             raise self.error("no se puede usar una expresión de asignación como sentencia")
+        if self.at(TokenType.OP, ":"):
+            # ``x: int = 5``: una anotación de tipo. La anotación se
+            # evalúa (por sus efectos secundarios) y el valor se asigna.
+            self.advance()
+            annotation = self.parse_test()
+            value = None
+            if self.accept(TokenType.OP, "="):
+                value = self.parse_expr_list()
+            target = self.to_target(expr)
+            if isinstance(target, (N.Tuple, N.List)):
+                raise self.error("no se puede anotar una tupla o una lista")
+            return N.AnnAssign(
+                target=target, annotation=annotation, value=value, lineno=expr.lineno
+            )
         if self.at(TokenType.OP, "="):
             targets = [self.to_target(expr)]
             while self.accept(TokenType.OP, ","):
                 targets.append(self.to_target(self.parse_expr_list()))
-            self.expect(TokenType.OP, "=")
-            value = self.parse_expr_list()
+            # ``x = y = 5``: la asignación se encadena. En Python es
+            # ``x = (y = 5)``: el mismo valor va a todos los destinos.
+            value = None
+            while True:
+                self.expect(TokenType.OP, "=")
+                siguiente = self.parse_expr_list()
+                if self.at(TokenType.OP, "="):
+                    targets.append(self.to_target(siguiente))
+                    continue
+                value = siguiente
+                break
             return N.Assign(targets=targets, value=value, lineno=expr.lineno)
         token = self.peek()
         if token.type is TokenType.OP and token.value in AUG_ASSIGN_OPS:
@@ -279,16 +312,50 @@ class Parser:
         if self.accept(TokenType.OP, "="):
             source = self.parse_expr_list()
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
+        body = self.parse_suite()
         return N.BlobDecl(name=name, source=source, body=body, lineno=token.lineno)
 
     def parse_func_def(self) -> N.FuncDef:
         token = self.advance()  # 'func' o 'def'
         name = self.expect(TokenType.NAME).value
         args = self.parse_arguments()
+        returns = None
+        if self.accept(TokenType.OP, "->"):
+            # ``def f() -> int``: la anotación de retorno se guarda y se
+            # ignora, como en Python, donde sólo la usan las herramientas
+            # de análisis estático.
+            returns = self.parse_test()
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
-        return N.FuncDef(name=name, args=args, body=body, lineno=token.lineno)
+        # El cuerpo de una función es el único sitio donde puede aparecer un
+        # ``yield``, como en Python.
+        self.profundidad_de_funciones += 1
+        try:
+            body = self.parse_suite()
+        finally:
+            self.profundidad_de_funciones -= 1
+        return N.FuncDef(
+            name=name,
+            args=args,
+            body=body,
+            returns=returns,
+            doc=self._docstring_de(body),
+            lineno=token.lineno,
+        )
+
+    def _docstring_de(self, body: List[Any]) -> Optional[str]:
+        """El docstring de un cuerpo: su primera sentencia, si es una cadena.
+
+        Como en Python, el docstring no es una sentencia que haga nada: es
+        el texto que ``f.__doc__`` devuelve.
+        """
+        if not body:
+            return None
+        primero = body[0]
+        if isinstance(primero, N.ExprStmt) and isinstance(primero.value, N.Constant):
+            valor = primero.value.value
+            if isinstance(valor, str):
+                return valor
+        return None
 
     def parse_decorated(self) -> Any:
         """Parsea ``@decorador`` seguido de la ``def`` o ``class`` que decora.
@@ -328,8 +395,21 @@ class Parser:
                     break
             self.expect(TokenType.OP, ")")
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
-        return N.ClassDef(name=name, bases=bases, body=body, lineno=token.lineno)
+        # El cuerpo de una clase no es un ámbito de función: un ``yield``
+        # dentro de él es un error de sintaxis, como en Python.
+        profundidad = self.profundidad_de_funciones
+        self.profundidad_de_funciones = 0
+        try:
+            body = self.parse_suite()
+        finally:
+            self.profundidad_de_funciones = profundidad
+        return N.ClassDef(
+            name=name,
+            bases=bases,
+            body=body,
+            doc=self._docstring_de(body),
+            lineno=token.lineno,
+        )
 
     def parse_with(self) -> N.With:
         """Parsea ``with expr as nombre, expr2 as nombre2:``."""
@@ -345,7 +425,7 @@ class Parser:
             if not self.accept(TokenType.OP, ","):
                 break
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
+        body = self.parse_suite()
         return N.With(items=items, body=body, lineno=token.lineno)
 
     def parse_with_target(self) -> Any:
@@ -360,8 +440,16 @@ class Parser:
             return self.to_target(self.parse_target_list())
         return self.parse_target_element()
 
-    def parse_arguments(self) -> N.Arguments:
-        self.expect(TokenType.OP, "(")
+    def parse_arguments(self, con_parentesis: bool = True) -> N.Arguments:
+        """Los parámetros de una función o de un ``lambda``.
+
+        Con ``con_parentesis=False`` se parsea la lista sin los paréntesis,
+        que es como se escriben los parámetros de un ``lambda``. En ese caso
+        no se admiten anotaciones: en Python, ``lambda x: int: x`` es un
+        error de sintaxis.
+        """
+        if con_parentesis:
+            self.expect(TokenType.OP, "(")
         args: List[N.Arg] = []
         defaults: List[Any] = []
         kwonly: List[N.Arg] = []
@@ -369,26 +457,57 @@ class Parser:
         kwarg: Optional[str] = None
         seen_default = False
         solo_palabra_clave = False
-        while not self.at(TokenType.OP, ")"):
+        vararg_annotation = None
+        kwarg_annotation = None
+        marca_posonly = False
+        while not self.at(TokenType.OP, ")") and not self.at(TokenType.OP, ":"):
             if self.accept(TokenType.OP, "**"):
                 kwarg = self.expect(TokenType.NAME).value
+                if con_parentesis and self.accept(TokenType.OP, ":"):
+                    # ``**kwargs: int``: la anotación se guarda, como en
+                    # Python, donde va a ``f.__annotations__``.
+                    kwarg_annotation = self.parse_test()
             elif self.at(TokenType.OP, "*"):
                 self.advance()
                 if self.at(TokenType.NAME):
-                    # ``*args``: argumentos posicionales extra.
+                    # ``*args``: argumentos posicionales extra. Lo que
+                    # venga después es sólo por palabra clave, como en
+                    # Python.
                     vararg = self.expect(TokenType.NAME).value
+                    if con_parentesis and self.accept(TokenType.OP, ":"):
+                        # ``*args: int``: la anotación se guarda.
+                        vararg_annotation = self.parse_test()
+                    solo_palabra_clave = True
                 else:
                     # ``*`` a secas: lo que sigue es sólo por palabra clave.
                     solo_palabra_clave = True
+            elif self.at(TokenType.OP, "/"):
+                # ``def f(a, /, b)``: lo que va antes de la barra sólo se
+                # puede pasar posicionalmente, como en Python.
+                self.advance()
+                if marca_posonly:
+                    raise self.error("sólo puede haber una barra '/' en los parámetros")
+                if solo_palabra_clave:
+                    raise self.error(
+                        "la barra '/' no puede ir después de un argumento "
+                        "sólo por palabra clave"
+                    )
+                for arg in args:
+                    arg.posonly = True
+                marca_posonly = True
             else:
                 arg_name = self.expect(TokenType.NAME).value
                 default = None
+                annotation = None
+                if con_parentesis and self.accept(TokenType.OP, ":"):
+                    # ``def f(x: int)``: la anotación se guarda y se ignora.
+                    annotation = self.parse_test()
                 if self.accept(TokenType.OP, "="):
                     default = self.parse_test()
                     seen_default = True
                 elif seen_default and not solo_palabra_clave:
                     raise self.error("argumento sin valor por defecto tras otro con valor")
-                arg = N.Arg(name=arg_name, default=default)
+                arg = N.Arg(name=arg_name, default=default, annotation=annotation)
                 if solo_palabra_clave:
                     kwonly.append(arg)
                 else:
@@ -397,39 +516,42 @@ class Parser:
                         defaults.append(default)
             if not self.accept(TokenType.OP, ","):
                 break
-        self.expect(TokenType.OP, ")")
+        if con_parentesis:
+            self.expect(TokenType.OP, ")")
         return N.Arguments(
             args=args,
             vararg=vararg,
             kwonlyargs=kwonly,
             kwarg=kwarg,
             defaults=defaults,
+            vararg_annotation=vararg_annotation,
+            kwarg_annotation=kwarg_annotation,
         )
 
     def parse_if(self) -> N.If:
         token = self.expect(TokenType.NAME, "if")
         test = self.parse_test()
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
+        body = self.parse_suite()
         orelse: List[Any] = []
         if self.at_keyword("elif"):
             orelse = [self.parse_if()]
         elif self.at_keyword("else"):
             self.advance()
             self.expect(TokenType.OP, ":")
-            orelse = self.parse_block()
+            orelse = self.parse_suite()
         return N.If(test=test, body=body, orelse=orelse, lineno=token.lineno)
 
     def parse_while(self) -> N.While:
         token = self.expect(TokenType.NAME, "while")
         test = self.parse_test()
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
+        body = self.parse_suite()
         orelse: List[Any] = []
         if self.at_keyword("else"):
             self.advance()
             self.expect(TokenType.OP, ":")
-            orelse = self.parse_block()
+            orelse = self.parse_suite()
         return N.While(test=test, body=body, orelse=orelse, lineno=token.lineno)
 
     def parse_for(self) -> N.For:
@@ -438,18 +560,18 @@ class Parser:
         self.expect(TokenType.NAME, "in")
         iterable = self.parse_expr_list()
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
+        body = self.parse_suite()
         orelse: List[Any] = []
         if self.at_keyword("else"):
             self.advance()
             self.expect(TokenType.OP, ":")
-            orelse = self.parse_block()
+            orelse = self.parse_suite()
         return N.For(target=target, iter=iterable, body=body, orelse=orelse, lineno=token.lineno)
 
     def parse_try(self) -> N.Try:
         token = self.expect(TokenType.NAME, "try")
         self.expect(TokenType.OP, ":")
-        body = self.parse_block()
+        body = self.parse_suite()
         handlers: List[N.ExceptHandler] = []
         while self.at_keyword("except"):
             self.advance()
@@ -464,18 +586,18 @@ class Parser:
                     name = self.expect(TokenType.NAME).value
             self.expect(TokenType.OP, ":")
             handlers.append(
-                N.ExceptHandler(type=exc_type, name=name, body=self.parse_block())
+                N.ExceptHandler(type=exc_type, name=name, body=self.parse_suite())
             )
         orelse: List[Any] = []
         finalbody: List[Any] = []
         if self.at_keyword("else"):
             self.advance()
             self.expect(TokenType.OP, ":")
-            orelse = self.parse_block()
+            orelse = self.parse_suite()
         if self.at_keyword("finally"):
             self.advance()
             self.expect(TokenType.OP, ":")
-            finalbody = self.parse_block()
+            finalbody = self.parse_suite()
         return N.Try(
             body=body, handlers=handlers, orelse=orelse, finalbody=finalbody, lineno=token.lineno
         )
@@ -505,10 +627,30 @@ class Parser:
         self.advance()  # DEDENT
         return body
 
+    def parse_suite(self) -> List[Any]:
+        """El cuerpo de una sentencia compuesta.
+
+        Puede ser un bloque indentado (``if x:`` seguido de líneas
+        indentadas) o una lista de sentencias simples en la misma línea
+        (``if x: y``), como en Python. En el segundo caso las sentencias se
+        separan por ``;``.
+        """
+        if self.at(TokenType.NEWLINE):
+            return self.parse_block()
+        body: List[Any] = []
+        while True:
+            body.append(self.parse_small_statement())
+            if not self.accept(TokenType.OP, ";"):
+                break
+            if self.at(TokenType.NEWLINE):
+                break
+        self.expect(TokenType.NEWLINE)
+        return body
+
     # -- expresiones ---------------------------------------------------
     def parse_expr_list(self) -> Any:
         """``a, b, c`` devuelve una tupla si hay comas, si no la primera expresión."""
-        first = self.parse_test()
+        first = self.parse_star_or_test()
         if not self.at(TokenType.OP, ","):
             return first
         elements = [first]
@@ -554,6 +696,14 @@ class Parser:
     def parse_yield(self) -> N.Yield:
         """Parsea ``yield``, ``yield valor`` y ``yield from iterable``."""
         token = self.expect(TokenType.NAME, "yield")
+        if self.profundidad_de_funciones == 0:
+            # En Python, un ``yield`` fuera de una función es un error de
+            # sintaxis: "'yield' outside function".
+            raise CruthonSyntaxError(
+                "'yield' outside function",
+                self.filename,
+                token.lineno,
+            )
         if self.at_keyword("from"):
             self.advance()
             value = self.parse_test()
@@ -573,20 +723,9 @@ class Parser:
 
     def parse_lambda(self) -> N.Lambda:
         token = self.expect(TokenType.NAME, "lambda")
-        args = N.Arguments()
-        names: List[N.Arg] = []
-        defaults: List[Any] = []
-        while not self.at(TokenType.OP, ":"):
-            name = self.expect(TokenType.NAME).value
-            default = None
-            if self.accept(TokenType.OP, "="):
-                default = self.parse_test()
-                defaults.append(default)
-            names.append(N.Arg(name=name, default=default))
-            if not self.accept(TokenType.OP, ","):
-                break
-        args.args = names
-        args.defaults = defaults
+        # Los parámetros de un ``lambda`` se escriben como los de una
+        # función, pero sin paréntesis: ``lambda x, *args, **kw: ...``.
+        args = self.parse_arguments(con_parentesis=False)
         self.expect(TokenType.OP, ":")
         body = self.parse_test()
         return N.Lambda(args=args, body=body, lineno=token.lineno)
@@ -799,6 +938,10 @@ class Parser:
 
     def parse_primary(self) -> Any:
         token = self.peek()
+        if token.type is TokenType.OP and token.value == "...":
+            # ``...`` es el literal de Ellipsis, como en Python.
+            self.advance()
+            return N.Constant(value=Ellipsis, lineno=token.lineno)
         if token.type is TokenType.NUMBER:
             self.advance()
             return N.Constant(value=token.value, lineno=token.lineno)
@@ -831,6 +974,16 @@ class Parser:
                 self.advance()
                 return N.Tuple(elts=[], lineno=token.lineno)
             first = self.parse_star_or_test()
+            if self.at_keyword("for"):
+                # ``(x for x in y)``: una expresión generadora entre
+                # paréntesis, como en Python.
+                if isinstance(first, N.Starred):
+                    raise self.error("no se puede usar '*' en una comprensión")
+                generators = self.parse_comprehensions()
+                self.expect(TokenType.OP, ")")
+                return N.GeneratorExp(
+                    elt=first, generators=generators, lineno=token.lineno
+                )
             if self.at(TokenType.OP, ","):
                 elements = [first]
                 while self.accept(TokenType.OP, ","):
@@ -890,6 +1043,12 @@ class Parser:
             while self.accept(TokenType.OP, ","):
                 if self.at(TokenType.OP, "}"):
                     break
+                if self.at(TokenType.OP, "**"):
+                    # ``{'a': 1, **otro}``: se expande otro diccionario.
+                    self.advance()
+                    keys.append(N.Starred(value=self.parse_test(), lineno=token.lineno))
+                    values.append(None)
+                    continue
                 key = self.parse_test()
                 self.expect(TokenType.OP, ":")
                 values.append(self.parse_test())
@@ -961,26 +1120,82 @@ class Parser:
             if kind == "str":
                 values.append(N.Constant(value=payload, lineno=token.lineno))
                 continue
-            source, conversion, spec = payload  # type: ignore[misc]
+            source, conversion, spec, debug = payload  # type: ignore[misc]
             sub = Parser(tokenize(source, self.filename), self.filename)
             expression = sub.parse_test()
             format_spec = None
             if spec:
-                # El formato de una f-string es texto literal, como en CPython:
-                # ``f"{x:03d}"`` formatea con la especificación "03d".
-                format_spec = N.Constant(
-                    value=decode_escapes(spec, self.filename, token.lineno),
-                    lineno=token.lineno,
-                )
+                format_spec = self._build_format_spec(spec, token)
             values.append(
                 N.FormattedValue(
                     value=expression,
                     conversion=conversion,
                     format_spec=format_spec,
+                    debug=debug,
                     lineno=token.lineno,
                 )
             )
         return N.JoinedStr(values=values, lineno=token.lineno)
+
+    def _build_format_spec(self, spec: str, token: Token) -> Any:
+        """Construye el nodo de la especificación de formato de una f-string.
+
+        En CPython la especificación es texto literal (``f"{x:03d}"``), pero
+        puede contener campos anidados (``f"{x:{'0'}{2}d}"``), que se
+        evalúan y se concatenan al resto del formato. Por eso, cuando hay
+        llaves, la especificación se construye como una f-string más.
+        """
+        if "{" not in spec:
+            return N.Constant(
+                value=decode_escapes(spec, self.filename, token.lineno),
+                lineno=token.lineno,
+            )
+        valores: List[Any] = []
+        literal: List[str] = []
+        i = 0
+        n = len(spec)
+        while i < n:
+            ch = spec[i]
+            if ch == "{":
+                if spec[i : i + 2] == "{{":
+                    literal.append("{")
+                    i += 2
+                    continue
+                j = _find_closing_brace(spec, i)
+                if literal:
+                    valores.append(
+                        N.Constant(
+                            value=decode_escapes(
+                                "".join(literal), self.filename, token.lineno
+                            ),
+                            lineno=token.lineno,
+                        )
+                    )
+                    literal = []
+                sub = Parser(tokenize(spec[i + 1 : j], self.filename), self.filename)
+                valores.append(sub.parse_test())
+                i = j + 1
+                continue
+            if ch == "}":
+                if spec[i : i + 2] == "}}":
+                    literal.append("}")
+                    i += 2
+                    continue
+                raise CruthonSyntaxError(
+                    "f-string: '}' sin escapar", self.filename, token.lineno
+                )
+            literal.append(ch)
+            i += 1
+        if literal:
+            valores.append(
+                N.Constant(
+                    value=decode_escapes(
+                        "".join(literal), self.filename, token.lineno
+                    ),
+                    lineno=token.lineno,
+                )
+            )
+        return N.JoinedStr(values=valores, lineno=token.lineno)
 
     # -- utilidades ----------------------------------------------------
     def parse_target_list(self) -> Any:
@@ -990,56 +1205,68 @@ class Parser:
         interpretaría como la comparación ``i in xs`` (igual que hace el
         analizador de CPython, que usa ``star_targets`` y no una expresión).
         """
+        elements: List[Any] = []
         if self.at(TokenType.OP, "(") or self.at(TokenType.OP, "["):
-            closing = ")" if self.at(TokenType.OP, "(") else "]"
-            self.advance()
-            elements: List[Any] = []
-            while not self.at(TokenType.OP, closing):
-                elements.append(self.parse_target_element())
-                if not self.accept(TokenType.OP, ","):
-                    break
-            self.expect(TokenType.OP, closing)
-            if closing == ")":
-                return N.Tuple(elts=elements)
-            return N.List(elts=elements)
-        first = self.parse_target_element()
-        if not self.at(TokenType.OP, ","):
-            return first
-        elements = [first]
+            grupo = self._parse_target_group()
+            if not self.at(TokenType.OP, ","):
+                return grupo
+            # ``for (a, b), c in ...``: el grupo es el primer elemento de
+            # una tupla más grande, como en Python.
+            elements.append(grupo)
+        else:
+            first = self.parse_target_element()
+            if not self.at(TokenType.OP, ","):
+                return first
+            elements.append(first)
         while self.accept(TokenType.OP, ","):
             if self.at_keyword("in"):
                 break
             elements.append(self.parse_target_element())
         return N.Tuple(elts=elements)
 
+    def _parse_target_group(self) -> Any:
+        """Un destino entre paréntesis o corchetes: ``(a, b)`` o ``[a, b]``.
+
+        Igual que en Python, los paréntesis alrededor de un único destino sin
+        coma final sólo agrupan: ``for (a) in xs`` es lo mismo que
+        ``for a in xs``.
+        """
+        closing = ")" if self.at(TokenType.OP, "(") else "]"
+        self.advance()
+        elements: List[Any] = []
+        trailing = False
+        while not self.at(TokenType.OP, closing):
+            elements.append(self.parse_target_element())
+            if self.accept(TokenType.OP, ","):
+                trailing = True
+                continue
+            trailing = False
+            break
+        self.expect(TokenType.OP, closing)
+        if closing == ")":
+            if len(elements) == 1 and not trailing:
+                return elements[0]
+            return N.Tuple(elts=elements)
+        return N.List(elts=elements)
+
     def parse_target_element(self) -> Any:
         """Un elemento de destino: nombre, tupla/lista o ``*resto``."""
         if self.at(TokenType.OP, "*"):
             self.advance()
             return N.Starred(value=self.parse_target_element())
+        if self.at(TokenType.OP, "(") or self.at(TokenType.OP, "["):
+            # Destino anidado: ``for i, (a, b) in ...``.
+            return self.parse_target_list()
         token = self.expect(TokenType.NAME)
         return N.Name(id=token.value, lineno=token.lineno)
 
     def parse_del_target(self) -> Any:
         """Destino de un ``del``: un nombre, un atributo o un índice.
 
-        Es lo mismo que acepta CPython: ``del x``, ``del obj.attr`` y
-        ``del lista[0]``; lo demás es un error de sintaxis.
+        Es lo mismo que acepta CPython: ``del x``, ``del obj.attr``,
+        ``del lista[0]`` y ``del f()[0]``; lo demás es un error de sintaxis.
         """
-        node = self.parse_primary()
-        while True:
-            if self.at(TokenType.OP, "["):
-                self.advance()
-                index = self.parse_subscript()
-                self.expect(TokenType.OP, "]")
-                node = N.Subscript(value=node, slice=index, lineno=node.lineno)
-                continue
-            if self.at(TokenType.OP, "."):
-                self.advance()
-                attr = self.expect(TokenType.NAME)
-                node = N.Attribute(value=node, attr=attr.value, lineno=node.lineno)
-                continue
-            break
+        node = self.parse_postfix()
         if not isinstance(node, (N.Name, N.Attribute, N.Subscript)):
             raise self.error("no se puede eliminar esta expresión")
         return node
@@ -1051,10 +1278,29 @@ class Parser:
         if isinstance(node, (N.Attribute, N.Subscript)):
             return node
         if isinstance(node, (N.Tuple, N.List)):
-            node.elts = [self.to_target(element) for element in node.elts]
+            if sum(1 for element in node.elts if isinstance(element, N.Starred)) > 1:
+                # En Python, dos destinos con ``*`` en el mismo nivel son un
+                # error de sintaxis ("multiple starred expressions in
+                # assignment"). En niveles distintos sí vale: ``(a, *b), *c =
+                # ...`` reparte el valor entre los dos niveles.
+                raise self.error(
+                    "no puede haber más de un destino con '*' en el mismo nivel"
+                )
+            elementos: List[Any] = []
+            for element in node.elts:
+                if isinstance(element, N.Starred):
+                    # ``*resto`` sólo tiene sentido dentro de una tupla o
+                    # una lista: ``a, *b = ...``.
+                    elementos.append(N.Starred(value=self.to_target(element.value)))
+                else:
+                    elementos.append(self.to_target(element))
+            node.elts = elementos
             return node
         if isinstance(node, N.Starred):
-            return node
+            # Un ``*`` suelto no es un destino válido, como en Python.
+            raise self.error(
+                "el destino con '*' debe estar dentro de una tupla o una lista"
+            )
         raise self.error("no se puede asignar a esta expresión")
 
 

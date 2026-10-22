@@ -88,7 +88,11 @@ class CruthonREPL:
         ``("ok", modulo)`` si se pudo analizar.
         """
         try:
-            return ("ok", parse(self._source(), self.filename))
+            module = parse(self._source(), self.filename)
+            # En la REPL cada instrucción es su propio módulo: no hay
+            # docstring de módulo, como en la consola de Python.
+            module.doc = None
+            return ("ok", module)
         except IncompleteInput:
             return ("incompleto", None)
         except CruthonSyntaxError as error:
@@ -161,7 +165,7 @@ class CruthonREPL:
     # -- utilidades -------------------------------------------------------
     def report(self, error: CruthonSyntaxError) -> None:
         print(f'  File "{self.filename}", line {error.lineno}', file=sys.stderr)
-        print(f"    {error.message}", file=sys.stderr)
+        print(f"SyntaxError: {error.message}", file=sys.stderr)
 
     def report_runtime(self, error: Exception) -> None:
         name = type(error).__name__

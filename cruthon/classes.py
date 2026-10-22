@@ -21,6 +21,28 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
+class _Docstring:
+    """Descriptor del atributo ``__doc__`` de los objetos de Cruthon.
+
+    El atributo ``__doc__`` lo ocupa el docstring que escribió el usuario
+    (``f.__doc__``, ``C.__doc__``), que es lo que Python devuelve. El
+    docstring de esta implementación se guarda aparte y se devuelve cuando
+    se pide el de la clase (``CruthonClass.__doc__``) en vez del de una
+    instancia.
+    """
+
+    __slots__ = ("_doc_de_la_implementacion",)
+
+    def __init__(self, doc_de_la_implementacion: Optional[str] = None) -> None:
+        self._doc_de_la_implementacion = doc_de_la_implementacion
+
+    def __get__(self, obj: Any, objtype: Any = None) -> Any:
+        if obj is None:
+            # Se pide el docstring de la clase: el de esta implementación.
+            return self._doc_de_la_implementacion
+        return obj._docstring_del_usuario()
+
+
 class _Ausente:
     """Marca de "no encontrado" (distinta de ``None``)."""
 
@@ -31,6 +53,13 @@ class _Ausente:
 
 
 AUSENTE = _Ausente()
+
+#: Los atributos internos de :class:`CruthonClass` (los de ``__slots__``).
+#: Todo lo demás que se asigne a la clase es un atributo suyo, visible desde
+#: sus instancias, como en Python.
+_SLOTS_DE_LA_CLASE = frozenset(
+    {"_nombre", "_bases", "_namespace", "_blob", "_mro", "_bases_py"}
+)
 
 
 def mro_de(clase: "CruthonClass") -> List["CruthonClass"]:
@@ -68,6 +97,8 @@ class CruthonClass:
     """Una clase de Cruthon (``class Nombre(Base): ...``)."""
 
     __slots__ = ("_nombre", "_bases", "_namespace", "_blob", "_mro", "_bases_py")
+
+    __doc__ = _Docstring(__doc__)
 
     def __init__(
         self,
@@ -114,6 +145,36 @@ class CruthonClass:
             self._mro = mro_de(self)
         return self._mro
 
+    @property
+    def __mro__(self) -> Tuple[Any, ...]:
+        """El MRO como tupla, como en Python (``C.__mro__``).
+
+        Las clases de Cruthon van primero, después las bases que son tipos de
+        Python (``class M(list):``) y al final ``object``, que en CPython
+        cierra la cadena de herencia de todas las clases.
+        """
+        mro: List[Any] = list(self.mro)
+        for base_py in self._bases_py:
+            for clase in base_py.__mro__:
+                if clase not in mro:
+                    mro.append(clase)
+        if object not in mro:
+            mro.append(object)
+        return tuple(mro)
+
+    @property
+    def __bases__(self) -> Tuple[Any, ...]:
+        """Las bases directas, como en Python (``C.__bases__``)."""
+        bases: List[Any] = list(self._bases)
+        for base_py in self._bases_py:
+            if base_py not in bases:
+                bases.append(base_py)
+        return tuple(bases)
+
+    def _docstring_del_usuario(self) -> Optional[str]:
+        """El docstring que escribió el usuario, si la clase tiene uno."""
+        return self._namespace.get("__doc__")
+
     # -- búsqueda de nombres --------------------------------------------
     def lookup(self, nombre: str) -> Any:
         """Busca ``nombre`` en el MRO; devuelve ``AUSENTE`` si no está."""
@@ -130,6 +191,27 @@ class CruthonClass:
             raise AttributeError(
                 f"type object '{self._nombre}' has no attribute '{nombre}'"
             )
+        return self._valor_de_la_clase(encontrado)
+
+    def __getattribute__(self, nombre: str) -> Any:
+        """Da prioridad al ``__init__`` (y al resto de métodos especiales) que
+        escribió el usuario.
+
+        En Python, ``C.__init__`` es el ``__init__`` de la clase, no el de la
+        maquinaria que la representa: el método especial del usuario manda
+        sobre el de la implementación, igual que con cualquier otro atributo
+        del cuerpo de la clase.
+        """
+        if nombre.startswith("__") and nombre.endswith("__"):
+            if nombre not in ("__mro__", "__bases__", "__doc__"):
+                namespace = object.__getattribute__(self, "_namespace")
+                for clase in object.__getattribute__(self, "mro"):
+                    if nombre in clase._namespace:
+                        return self._valor_de_la_clase(clase._namespace[nombre])
+        return object.__getattribute__(self, nombre)
+
+    def _valor_de_la_clase(self, encontrado: Any) -> Any:
+        """El valor de un miembro de la clase, como lo devolvería Python."""
         if isinstance(encontrado, CruthonMethod):
             # En Python 3, ``A.f`` es la función suelta, no un método ligado.
             return encontrado.funcion
@@ -141,13 +223,20 @@ class CruthonClass:
         return encontrado
 
     def __setattr__(self, nombre: str, valor: Any) -> None:
-        if nombre.startswith("_"):
+        if nombre in _SLOTS_DE_LA_CLASE:
+            # Los atributos internos de la clase (``_nombre``, ``_mro``...)
+            # van al objeto; todo lo demás es un atributo de la clase.
             object.__setattr__(self, nombre, valor)
             return
         self._namespace[nombre] = valor
 
     def __repr__(self) -> str:
-        return f"<class '{self._nombre}'>"
+        # Como en Python, la repr de una clase incluye el módulo donde vive:
+        # ``<class '__main__.C'>``. En Cruthon el módulo es el blob.
+        modulo = getattr(self._blob, "name", None)
+        if not modulo or modulo == "<blob>":
+            return f"<class '{self._nombre}'>"
+        return f"<class '{modulo}.{self._nombre}'>"
 
 
 def _es_descriptor(valor: Any) -> bool:
@@ -157,14 +246,35 @@ def _es_descriptor(valor: Any) -> bool:
     return hasattr(type(valor), "__get__")
 
 
-class CruthonInstance:
-    """Una instancia de una clase de Cruthon."""
+def _es_descriptor_de_datos(valor: Any) -> bool:
+    """¿Es un descriptor de datos? (los que además definen ``__set__``).
 
-    __slots__ = ("_clase", "_atributos", "_base_obj")
+    Un descriptor de datos tiene prioridad sobre el diccionario de la
+    instancia, como en Python: por eso una ``property`` con setter recibe
+    la asignación en vez de guardarse como un atributo cualquiera.
+    """
+    if isinstance(valor, CruthonMethod):
+        return False
+    tipo = type(valor)
+    return hasattr(tipo, "__set__") or hasattr(tipo, "__delete__")
+
+
+class CruthonInstance:
+    """Una instancia de una clase de Cruthon.
+
+    Los atributos del usuario viven en el diccionario de la instancia, como
+    en Python: así ``object.__setattr__(self, ...)`` funciona, ``vars()``
+    devuelve lo que devolvería en CPython y el idiom
+    ``def __setattr__(self, n, v): object.__setattr__(self, n, v)`` hace lo
+    que el usuario espera.
+    """
+
+    __slots__ = ("_clase", "_base_obj", "__dict__")
+
+    __doc__ = _Docstring(__doc__)
 
     def __init__(self, clase: CruthonClass, base_obj: Any = None) -> None:
         object.__setattr__(self, "_clase", clase)
-        object.__setattr__(self, "_atributos", {})
         #: El objeto nativo sobre el que se apoya la instancia cuando la clase
         #: hereda de un tipo de Python (``class M(list):``).
         object.__setattr__(self, "_base_obj", base_obj)
@@ -174,41 +284,111 @@ class CruthonInstance:
         """El objeto de Python en el que se apoya la instancia, si lo hay."""
         return object.__getattribute__(self, "_base_obj")
 
+    def _docstring_del_usuario(self) -> Optional[str]:
+        """El docstring de la clase, como en Python (``instancia.__doc__``)."""
+        return self._clase.__doc__
+
     # -- acceso a atributos ---------------------------------------------
-    def __getattr__(self, nombre: str) -> Any:
-        atributos = object.__getattribute__(self, "_atributos")
-        if nombre in atributos:
-            return atributos[nombre]
+    @property
+    def __class__(self) -> "CruthonClass":
+        """La clase de la instancia, como en Python.
+
+        ``tipo(instancia)`` sigue siendo ``CruthonInstance`` (el tipo real
+        del objeto de Python), pero ``instancia.__class__`` es la clase de
+        Cruthon, que es lo que el código de Python consulta.
+        """
+        return object.__getattribute__(self, "_clase")
+
+    def __getattribute__(self, nombre: str) -> Any:
+        """Busca un atributo con el orden de CPython.
+
+        Primero los descriptores de datos de la clase (una ``property``
+        manda sobre el diccionario de la instancia), después el diccionario
+        de la instancia, después los demás miembros de la clase y, si no
+        aparece nada, el ``__getattr__`` que haya escrito el usuario.
+        """
+        if nombre in ("_clase", "_base_obj"):
+            return object.__getattribute__(self, nombre)
         clase = object.__getattribute__(self, "_clase")
         encontrado = clase.lookup(nombre)
-        if encontrado is AUSENTE:
-            base = object.__getattribute__(self, "_base_obj")
-            if base is not None:
-                # La clase hereda de un tipo de Python: sus métodos y
-                # atributos son los de ese tipo.
-                return getattr(base, nombre)
-            raise AttributeError(
-                f"'{clase.nombre}' object has no attribute '{nombre}'"
-            )
-        if isinstance(encontrado, CruthonMethod):
-            return encontrado.ligar(self)
-        if _es_descriptor(encontrado):
-            # ``property`` y compañía: el acceso dispara el descriptor.
+        if encontrado is not AUSENTE and _es_descriptor_de_datos(encontrado):
+            # Un descriptor de datos manda sobre el diccionario de la
+            # instancia, como en Python: ``obj.x`` siempre pasa por el
+            # ``property``, aunque ``x`` esté en el diccionario.
             return encontrado.__get__(self, clase)
-        return encontrado
+        atributos = object.__getattribute__(self, "__dict__")
+        if nombre in atributos:
+            return atributos[nombre]
+        if encontrado is not AUSENTE:
+            if isinstance(encontrado, CruthonMethod):
+                return encontrado.ligar(self)
+            if _es_descriptor(encontrado):
+                # ``property`` y compañía: el acceso dispara el descriptor.
+                return encontrado.__get__(self, clase)
+            return encontrado
+        try:
+            # Los atributos de la propia implementación (``__class__``,
+            # ``__doc__`` y el resto del protocolo).
+            return object.__getattribute__(self, nombre)
+        except AttributeError:
+            pass
+        base = object.__getattribute__(self, "_base_obj")
+        if base is not None:
+            # La clase hereda de un tipo de Python: sus métodos y
+            # atributos son los de ese tipo.
+            return getattr(base, nombre)
+        gancho = clase.lookup("__getattr__")
+        if gancho is not AUSENTE:
+            # El usuario escribió un ``__getattr__``: se llama con el
+            # nombre del atributo que no se encontró.
+            return self._llamar_al_gancho(gancho, nombre)
+        raise AttributeError(
+            f"'{clase.nombre}' object has no attribute '{nombre}'"
+        )
 
     def __setattr__(self, nombre: str, valor: Any) -> None:
-        if nombre.startswith("_"):
-            object.__setattr__(self, nombre, valor)
+        clase = object.__getattribute__(self, "_clase")
+        gancho = clase.lookup("__setattr__")
+        if gancho is not AUSENTE:
+            # El usuario escribió un ``__setattr__``: la asignación pasa por
+            # él, como en Python.
+            self._llamar_al_gancho(gancho, nombre, valor)
             return
-        object.__getattribute__(self, "_atributos")[nombre] = valor
+        encontrado = clase.lookup(nombre)
+        if encontrado is not AUSENTE and _es_descriptor_de_datos(encontrado):
+            # Una ``property`` con setter: la asignación pasa por el setter
+            # en vez de guardarse como un atributo cualquiera.
+            encontrado.__set__(self, valor)
+            return
+        # Todos los atributos del usuario van al diccionario de la
+        # instancia, también los que empiezan por ``_``: en Python
+        # ``self._privado = 1`` es lo normal.
+        object.__getattribute__(self, "__dict__")[nombre] = valor
 
     def __delattr__(self, nombre: str) -> None:
-        atributos = object.__getattribute__(self, "_atributos")
+        clase = object.__getattribute__(self, "_clase")
+        gancho = clase.lookup("__delattr__")
+        if gancho is not AUSENTE:
+            self._llamar_al_gancho(gancho, nombre)
+            return
+        encontrado = clase.lookup(nombre)
+        if encontrado is not AUSENTE and hasattr(type(encontrado), "__delete__"):
+            # Un descriptor con ``__delete__`` decide cómo se borra.
+            encontrado.__delete__(self)
+            return
+        atributos = object.__getattribute__(self, "__dict__")
         if nombre in atributos:
             del atributos[nombre]
             return
-        object.__delattr__(self, nombre)
+        raise AttributeError(
+            f"'{clase.nombre}' object has no attribute '{nombre}'"
+        )
+
+    def _llamar_al_gancho(self, gancho: Any, *args: Any) -> Any:
+        """Llama a un método especial que escribió el usuario."""
+        if isinstance(gancho, CruthonMethod):
+            return gancho.ligar(self)(*args)
+        return gancho(self, *args)
 
     @property
     def clase(self) -> CruthonClass:
@@ -318,6 +498,82 @@ class CruthonInstance:
             return object.__hash__(self)
         return int(ligable())
 
+    def __format__(self, spec: str) -> str:
+        ligable = _delega(self, "__format__")
+        if ligable is AUSENTE:
+            if spec:
+                raise TypeError(
+                    "unsupported format string passed to "
+                    f"{object.__getattribute__(self, '_clase').nombre}.__format__"
+                )
+            return str(self)
+        return str(ligable(spec))
+
+    def __index__(self) -> int:
+        ligable = _delega(self, "__index__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                f"'{object.__getattribute__(self, '_clase').nombre}' object "
+                "cannot be interpreted as an integer"
+            )
+        return int(ligable())
+
+    def __int__(self) -> int:
+        ligable = _delega(self, "__int__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                "int() argument must be a string, a bytes-like object or a "
+                f"real number, not '{object.__getattribute__(self, '_clase').nombre}'"
+            )
+        return int(ligable())
+
+    def __float__(self) -> float:
+        ligable = _delega(self, "__float__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                "float() argument must be a string or a real number, not "
+                f"'{object.__getattribute__(self, '_clase').nombre}'"
+            )
+        return float(ligable())
+
+    def __bytes__(self) -> bytes:
+        ligable = _delega(self, "__bytes__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                f"cannot convert '{object.__getattribute__(self, '_clase').nombre}' "
+                "object to bytes"
+            )
+        return bytes(ligable())
+
+    def __reversed__(self) -> Any:
+        ligable = _delega(self, "__reversed__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                f"'{object.__getattribute__(self, '_clase').nombre}' object "
+                "is not reversible"
+            )
+        return ligable()
+
+    def __round__(self, ndigits: Any = None) -> Any:
+        ligable = _delega(self, "__round__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                f"type '{object.__getattribute__(self, '_clase').nombre}' "
+                "doesn't define __round__ method"
+            )
+        if ndigits is None:
+            return ligable()
+        return ligable(ndigits)
+
+    def __trunc__(self) -> int:
+        ligable = _delega(self, "__trunc__")
+        if ligable is AUSENTE:
+            raise TypeError(
+                f"'{object.__getattribute__(self, '_clase').nombre}' object "
+                "cannot be interpreted as an integer"
+            )
+        return int(ligable())
+
 
 def _delega(instancia: "CruthonInstance", nombre: str) -> Any:
     """Busca un método especial en el MRO de la clase de la instancia.
@@ -370,6 +626,9 @@ def _metodo_delegado(nombre: str):
 #: Métodos especiales que se delegan tal cual en el MRO de la clase.
 _METODOS_DELEGADOS = (
     "__lt__", "__le__", "__gt__", "__ge__",
+    # ``__next__`` hace falta para que un iterador propio funcione: Python
+    # comprueba que el objeto devuelto por ``__iter__`` tenga ``__next__``.
+    "__next__",
     "__add__", "__radd__", "__sub__", "__rsub__",
     "__mul__", "__rmul__", "__truediv__", "__rtruediv__",
     "__floordiv__", "__rfloordiv__", "__mod__", "__rmod__",
@@ -388,6 +647,8 @@ class CruthonMethod:
 
     __slots__ = ("funcion", "clase")
 
+    __doc__ = _Docstring(__doc__)
+
     def __init__(self, funcion: Any, clase: Optional[CruthonClass]) -> None:
         self.funcion = funcion
         self.clase = clase
@@ -398,14 +659,23 @@ class CruthonMethod:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.funcion(*args, **kwargs)
 
+    def _docstring_del_usuario(self) -> Optional[str]:
+        """El docstring del método, como en Python (``C.m.__doc__``)."""
+        return self.funcion.__doc__
+
     def __repr__(self) -> str:
-        return f"<method {getattr(self.funcion, 'name', '?')}>"
+        nombre = getattr(self.funcion, "name", "?")
+        if self.clase is not None:
+            nombre = f"{self.clase.nombre}.{nombre}"
+        return f"<method {nombre}>"
 
 
 class CruthonBoundMethod:
     """Un método con la instancia ya enlazada como primer argumento."""
 
     __slots__ = ("funcion", "instancia", "clase")
+
+    __doc__ = _Docstring(__doc__)
 
     def __init__(
         self,
@@ -423,8 +693,16 @@ class CruthonBoundMethod:
             self.funcion, self.instancia, list(args), dict(kwargs)
         )
 
+    def _docstring_del_usuario(self) -> Optional[str]:
+        """El docstring del método, como en Python (``obj.m.__doc__``)."""
+        return self.funcion.__doc__
+
     def __repr__(self) -> str:
-        return f"<bound method {getattr(self.funcion, 'name', '?')}>"
+        # Como en Python: ``<bound method C.m of <C object at 0x...>>``.
+        nombre = getattr(self.funcion, "name", "?")
+        if self.clase is not None:
+            nombre = f"{self.clase.nombre}.{nombre}"
+        return f"<bound method {nombre} of {self.instancia!r}>"
 
 
 class SuperFabrica:
@@ -441,8 +719,20 @@ class SuperFabrica:
         self.clase = clase
         self.instancia = instancia
 
-    def __call__(self) -> "CruthonSuper":
-        return CruthonSuper(self.clase, self.instancia)
+    def __call__(self, *args: Any) -> "CruthonSuper":
+        if not args:
+            return CruthonSuper(self.clase, self.instancia)
+        if len(args) == 2:
+            # ``super(Clase, instancia)``: la forma explícita de Python.
+            clase, instancia = args
+            if not isinstance(clase, CruthonClass) or not isinstance(
+                instancia, CruthonInstance
+            ):
+                raise TypeError(
+                    "super() espera una clase y una instancia"
+                )
+            return CruthonSuper(clase, instancia)
+        raise TypeError("super() acepta cero o dos argumentos")
 
     def __repr__(self) -> str:
         return "<super>"
