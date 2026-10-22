@@ -1055,8 +1055,26 @@ class Interpreter:
             return
         blob.define(name, value)
 
+    def _rechaza_region_como_valor(self, target: N.Name, blob: Blob) -> None:
+        """Un nombre que ya es una región de este blob no se reasigna a un valor.
+
+        Es la regla de unicidad vista al revés: el nombre ya está tomado por
+        una región, y escribir un valor encima lo dejaría con dos
+        significados en el mismo blob. Se señala en la línea de la
+        asignación, que es donde está el error.
+        """
+        nombre = target.id
+        if nombre in blob.refs and nombre not in blob.storage:
+            raise DuplicateName(
+                f"ya vive una región {nombre!r} en el blob {blob.name!r}: "
+                "un nombre es único dentro de su blob",
+                self.filename,
+                target.lineno,
+            )
+
     def assign(self, target: Any, value: Any, blob: Blob, frame: Optional[Frame]) -> None:
         if isinstance(target, N.Name):
+            self._rechaza_region_como_valor(target, blob)
             self.assign_name(target.id, value, blob, frame)
             return
         if isinstance(target, N.Attribute):

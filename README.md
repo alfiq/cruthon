@@ -251,8 +251,9 @@ una clase y una clase no es un blob.
   aviso de calificar con la ruta de inclusión. Cuando las distancias son
   distintas, gana la más cercana.
 * **La unicidad.** Un nombre es único dentro de su blob: dos regiones del
-  mismo blob no pueden compartirlo, y la segunda declaración falla en su
-  propia línea (`DuplicateName`), no donde después se usa el nombre. Una
+  mismo blob no pueden compartirlo (tampoco una región y un valor: `A = 5`
+  donde ya hay `blob A:` falla), y la segunda declaración falla en su propia
+  línea (`DuplicateName`), no donde después se usa el nombre. Una
   región, en cambio, es única por su ruta de inclusión: `main.A.API` y
   `main.B.API` son cosas distintas aunque las dos se llamen `API`.
 * **Los cuatro operadores.** `&`, `|`, `-` y `^` entre dos *blobs* ejecutan
@@ -362,7 +363,7 @@ Las decisiones y las buenas prácticas están en
 ## Pruebas
 
 ```bash
-python -m pytest            # 482 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
+python -m pytest            # 483 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
 ```
 
 ## El documento de diseño

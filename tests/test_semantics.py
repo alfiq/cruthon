@@ -703,3 +703,21 @@ def test_la_tabla_de_pertenencia_muestra_rutas_de_inclusion():
     tabla = interpreter.globals.inclusion_table()
     assert tabla["y"] == ["main.A.y", "main.B.y"]
     assert tabla["main"] == ["main"]
+
+
+def test_una_region_no_se_reasigna_a_un_valor():
+    """El nombre ya está tomado por la región: se falla en la asignación."""
+    fuente = "\n".join(
+        [
+            "blob main:",
+            "    blob A:",
+            "        x = 1",
+            "    A = 5",
+            "",
+        ]
+    )
+    with pytest.raises(DuplicateName) as info:
+        ejecutar(fuente)
+    assert info.value.lineno == 4
+    assert "'A'" in str(info.value)
+    assert "región" in str(info.value)
