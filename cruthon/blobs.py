@@ -23,16 +23,21 @@ blobs declaran el mismo nombre y se intersectan, ambos operandos y la
 intersección pasan a compartir la misma celda: escribir por cualquiera de los
 tres se ve en los otros dos.
 
-La *tabla de pertenencia* (nombre -> blobs donde vive el nombre) y la
-resolución de nombres (``Blob.lookup``) comparten el mismo recorrido
-(``Blob.areas``): la tabla no es decorativa, es la lectura del modelo.
+La *tabla de pertenencia* (nombre -> rutas de inclusión) y la resolución de
+nombres (``Blob.lookup``) comparten el mismo recorrido por distancias: la
+tabla no es decorativa, es la lectura del modelo.
+
+Un nombre es único dentro de su blob y una región es única por su ruta de
+inclusión: ``main.A.API`` y ``main.B.API`` son regiones distintas. Desde
+``main``, leer ``API`` a secas es ambiguo, no una carrera que gane la primera
+declarada.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, FrozenSet, Iterator, List, Optional
 
-from .errors import BlobTypeError, NameNotFound
+from .errors import AmbiguousName, BlobTypeError, NameNotFound
 
 #: Operaciones de conjuntos soportadas entre blobs.
 SET_OPERATIONS = ("&", "|", "-", "^")
@@ -237,11 +242,10 @@ class Blob(Area):
         return self.name
 
     def membership_table(self) -> Dict[str, List[str]]:
-        """Tabla de pertenencia: nombre -> blobs donde vive.
+        """Tabla de pertenencia: nombre -> nombres de los blobs donde vive.
 
-        Es el sustituto cruthoniano del MRO de CPython: en vez de una cadena
-        lineal de herencia, cada nombre dice en qué blobs vive. Se construye
-        con el mismo recorrido que usa la resolución (``Blob.areas``).
+        Versión corta de ``inclusion_table``, que escribe la ruta completa
+        (``main.A.y``) y es la que conviene para diagnosticar ambigüedades.
         """
         tabla: Dict[str, List[str]] = {}
         vistos: set = set()
@@ -253,6 +257,32 @@ class Blob(Area):
                 nombres = tabla.setdefault(name, [])
                 if area.owner not in nombres:
                     nombres.append(area.owner)
+        return tabla
+
+    def inclusion_table(self) -> Dict[str, List[str]]:
+        """Tabla de pertenencia: nombre -> rutas de inclusión.
+
+        Las rutas se escriben desde este blob, sin nombrarlo: llamada sobre la
+        raíz de un programa con ``blob main: blob A: y = 1``, la ruta de ``y``
+        es ``main.A.y``. Un nombre que vive en dos áreas aparece con las dos
+        rutas, que es justo lo que la resolución considera ambiguo.
+        """
+        tabla: Dict[str, List[str]] = {}
+        nivel: List[tuple] = [(self, "")]
+        vistos: set = set()
+        while nivel:
+            siguiente: List[tuple] = []
+            for area, prefijo in nivel:
+                if id(area) in vistos:
+                    continue
+                vistos.add(id(area))
+                for nombre in area.declared_names():
+                    ruta = f"{prefijo}.{nombre}" if prefijo else nombre
+                    rutas = tabla.setdefault(nombre, [])
+                    if ruta not in rutas:
+                        rutas.append(ruta)
+                siguiente.extend(_inclusiones(area, prefijo))
+            nivel = siguiente
         return tabla
 
     # -- resolución de nombres -------------------------------------------
@@ -286,22 +316,102 @@ class Blob(Area):
         """Busca ``name`` entre las declaraciones propias del blob."""
         return self.resolve(name)
 
-    def lookup(self, name: str, _seen: Optional[set] = None) -> Optional[Ref]:
-        """Busca ``name`` en el área de este blob.
+    def lookup(self, name: str) -> Optional[Ref]:
+        """Busca ``name`` en el área de este blob, por distancia.
+
+        Gana la declaración más cercana. Si a esa distancia hay más de un
+        enlace --dos celdas distintas, o dos regiones distintas-- el nombre es
+        ambiguo y se lanza ``AmbiguousName`` con las rutas de inclusión que
+        compiten. Dos rutas que llegan a la misma celda son el mismo nombre:
+        la intersección comparte la celda con sus operandos y eso no es
+        ambigüedad, es memoria compartida.
 
         Devuelve ``None`` si el nombre no vive dentro del área: eso es un
         error de alcance, no un ``NameError`` de Python.
         """
-        for area in self.areas(_seen):
-            ref = area.resolve(name)
-            if ref is not None:
-                return ref
-        return None
+        candidatos = self._candidatos(name)
+        if not candidatos:
+            return None
+        enlaces: Dict[tuple, tuple] = {}
+        for ruta, ref in candidatos:
+            enlaces.setdefault(_identidad(ref), (ruta, ref))
+        if len(enlaces) > 1:
+            rutas = sorted(ruta for ruta, _ in enlaces.values())
+            # Las rutas se escriben desde este blob, que es donde se lee: son
+            # exactamente las calificaciones que sirven para desambiguar.
+            raise AmbiguousName(
+                f"el nombre {name!r} vive en más de un área a la misma "
+                f"distancia: {' y '.join(rutas)}; escribe la ruta de inclusión"
+            )
+        return next(iter(enlaces.values()))[1]
+
+    def _candidatos(self, name: str) -> List[tuple]:
+        """``(ruta, ref)`` de las declaraciones más cercanas de ``name``.
+
+        Recorre por niveles (primero el blob, después sus subconjuntos, y así)
+        y para en el primer nivel que declara el nombre: las distancias
+        mayores ya no pueden ganar. Las vistas de una operación de conjuntos
+        cuentan como una inclusión más, porque el operando es un subconjunto
+        del resultado.
+        """
+        nivel: List[tuple] = [(self, "")]
+        vistos: set = set()
+        while nivel:
+            encontrados: List[tuple] = []
+            for area, prefijo in nivel:
+                if id(area) in vistos:
+                    continue
+                vistos.add(id(area))
+                ref = area.resolve(name)
+                if ref is not None:
+                    ruta = f"{prefijo}.{name}" if prefijo else name
+                    encontrados.append((ruta, ref))
+            if encontrados:
+                return encontrados
+            siguiente: List[tuple] = []
+            for area, prefijo in nivel:
+                siguiente.extend(_inclusiones(area, prefijo))
+            nivel = siguiente
+        return []
 
     def __repr__(self) -> str:
         if self.op:
             return f"<blob {self.name} = {' '.join(op.name for op in self.operands)}>"
         return f"<blob {self.name}>"
+
+
+# ------------------------------------------------------------- inclusiones
+def _inclusiones(area: Area, prefijo: str) -> List[tuple]:
+    """Las áreas que se alcanzan con una inclusión más.
+
+    Los subconjuntos de un blob y las vistas de sus operaciones de conjuntos
+    (unión, diferencia, diferencia simétrica) cuentan igual: cada paso es una
+    inclusión, y la ruta se escribe con el nombre del área incluida.
+    """
+    vecinos: List[tuple] = []
+    if isinstance(area, Blob):
+        for child in area.children:
+            ruta = f"{prefijo}.{child.name}" if prefijo else child.name
+            vecinos.append((child, ruta))
+        for view in area.inherited:
+            ruta = f"{prefijo}.{view.owner}" if prefijo else view.owner
+            vecinos.append((view, ruta))
+    return vecinos
+
+
+def _identidad(ref: Ref) -> tuple:
+    """Identidad del enlace, para saber si dos rutas son el mismo nombre.
+
+    Un valor es el mismo si es la misma celda (la intersección la comparte con
+    sus operandos). Una región es la misma si es el mismo blob referenciado:
+    ``main.A.API`` y ``main.B.API`` son regiones distintas aunque se llamen
+    igual, y por eso su lectura desnuda es ambigua.
+    """
+    blob = ref.blob
+    celda = blob.storage.get(ref.name)
+    if celda is not None:
+        return ("celda", id(celda))
+    return ("blob", id(blob.refs.get(ref.name, blob)))
 
 
 # ---------------------------------------------------------------- operaciones

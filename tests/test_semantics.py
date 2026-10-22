@@ -31,7 +31,7 @@ import pytest
 
 from cruthon import Interpreter, parse
 from cruthon.blobs import Blob
-from cruthon.errors import NameNotFound, ScopeError
+from cruthon.errors import AmbiguousName, DuplicateName, NameNotFound, ScopeError
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -588,3 +588,118 @@ def test_except_exception_no_captura_una_interrupcion(tmp_path):
     assert proceso.returncode != 0
     assert "capturada" not in proceso.stdout
     assert "KeyboardInterrupt" in proceso.stderr
+
+
+# ------------------------------------------------------- nombres y ruta de inclusión
+DUPLICADO = '''
+blob main:
+    blob A:
+        x = 1
+    blob A:
+        y = 2
+'''
+
+AMBIGUO = '''
+blob main:
+    blob A:
+        y = "y de A"
+    blob B:
+        y = "y de B"
+
+print(y)
+'''
+
+CERCANO = '''
+blob main:
+    y = "el de main"
+    blob A:
+        y = "el de A"
+
+print(y)
+'''
+
+CALIFICADO = '''
+blob main:
+    blob A:
+        blob API:
+            x = 1
+    blob B:
+        blob API:
+            x = 2
+
+print(A.API.x, B.API.x)
+'''
+
+HERMANO_UNICO = '''
+blob main:
+    blob A:
+        z = "sólo en A"
+    blob B:
+        w = "sólo en B"
+
+print(z, w)
+'''
+
+TABLA = '''
+blob main:
+    blob A:
+        y = 1
+    blob B:
+        y = 2
+'''
+
+COMPARTIDO = '''
+blob main:
+    blob frontend:
+        total = 0
+    blob backend:
+        total = 0
+    blob carrito = frontend & backend:
+        items = []
+
+print(items, total)
+'''
+
+
+def test_dos_blobs_del_mismo_blob_no_pueden_compartir_nombre():
+    """La segunda declaración falla en su línea, no en el uso posterior."""
+    with pytest.raises(DuplicateName) as info:
+        ejecutar(DUPLICADO)
+    assert DUPLICADO.splitlines()[info.value.lineno - 1].strip() == "blob A:"
+    assert "'A'" in str(info.value)
+    assert "'main'" in str(info.value)
+
+
+def test_dos_regiones_a_la_misma_distancia_son_ambiguas():
+    """No gana la primera declarada: el mensaje nombra las dos rutas."""
+    with pytest.raises(AmbiguousName) as info:
+        ejecutar(AMBIGUO)
+    mensaje = str(info.value)
+    assert "main.A.y" in mensaje
+    assert "main.B.y" in mensaje
+    assert "ruta de inclusión" in mensaje
+
+
+def test_el_nombre_mas_cercano_gana_cuando_la_distancia_difiere():
+    assert ejecutar(CERCANO).strip() == "el de main"
+
+
+def test_dos_regiones_con_el_mismo_nombre_se_leen_calificadas():
+    assert ejecutar(CALIFICADO).split() == ["1", "2"]
+
+
+def test_un_nombre_que_solo_vive_en_un_blob_hermano_se_lee_desnudo():
+    assert ejecutar(HERMANO_UNICO).strip() == "sólo en A sólo en B"
+
+
+def test_la_memoria_compartida_no_se_confunde_con_ambiguedad():
+    """Dos rutas a la misma celda son el mismo nombre; no hay nada que elegir."""
+    assert ejecutar(COMPARTIDO).strip() == "[] 0"
+
+
+def test_la_tabla_de_pertenencia_muestra_rutas_de_inclusion():
+    interpreter = Interpreter("test")
+    interpreter.run(parse(TABLA, "test"))
+    tabla = interpreter.globals.inclusion_table()
+    assert tabla["y"] == ["main.A.y", "main.B.y"]
+    assert tabla["main"] == ["main"]

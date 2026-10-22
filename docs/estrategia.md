@@ -26,8 +26,10 @@ toma la segunda vía que el propio documento ofrece.
   conjuntos. Ese es el punto 3 ("generando una tabla de pertenencia por blob
   en vez de un MRO") y el 4 (`RESOLVE_MEMBER`). Ambos son cambios en la
   *semántica de resolución*, y el repositorio los implementa completos: la
-  tabla de pertenencia (`Blob.membership_table()`) y la resolución que la usa
-  (`Blob.lookup()`) están en [`cruthon/blobs.py`](../cruthon/blobs.py).
+  tabla de pertenencia con rutas de inclusión (`Blob.inclusion_table()`) y la
+  resolución que usa esas rutas, con la distancia decidiendo y la ambigüedad
+  a igual distancia fallando (`Blob.lookup()`), están en
+  [`cruthon/blobs.py`](../cruthon/blobs.py).
 * **Un fork exige un compilador y una cadena de build.** El punto 5 pide
   "mantener intacto todo el resto del pipeline ... para heredar el ecosistema
   de Python sin cambios". Eso exige modificar `Python/compile.c` y
@@ -52,7 +54,7 @@ La divergencia es real y conviene no disfrazarla:
 | --- | --- |
 | 1. Partir del código fuente de CPython | **Parcial.** Se usa CPython 3.14.7 como *referencia estructural* (léxico, parser, evaluador) y se estudió su repositorio; no se hace un fork de su código fuente. |
 | 2. Palabra clave `blob` en el tokenizer y el parser | **Hecho**, y además en el fork: ver abajo. |
-| 3. Tabla de pertenencia en vez de MRO | **Hecho.** `Blob.membership_table()` y `Blob.lookup()`. |
+| 3. Tabla de pertenencia en vez de MRO | **Hecho.** `Blob.inclusion_table()` (rutas de inclusión) y `Blob.lookup()`, que falla con `AmbiguousName` cuando dos regiones a la misma distancia compiten. |
 | 4. Opcode `RESOLVE_MEMBER` | **Equivalente funcional, no literal.** La resolución por pertenencia ocurre en `Blob.lookup()`, en Python, en vez de en un opcode de C. El *efecto* pedido (buscar el nombre en la tabla del blob activo y en las intersecciones alcanzables, y lanzar un error de alcance si no vive ahí) es el mismo. |
 | 5. Pipeline de CPython intacto | **Parcial.** Se hereda la biblioteca estándar y el modelo de sangría y de compilación-por-línea de CPython; no se hereda el bytecode de CPython, porque el intérprete es propio. |
 | 6. Caso de prueba mínimo (el carrito) | **Hecho.** [`examples/01_carrito.cruthon`](../examples/01_carrito.cruthon) y su resultado guardado, con la verificación de que `frontend` no ve `db` y `backend` no ve `dibujar_pagina`. |

@@ -112,3 +112,11 @@ def test_sin_argumentos_abre_la_repl(monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError))
     status, salida, _ = _correr([])
     assert status == 0
+
+
+def test_la_opcion_de_pertenencia_muestra_rutas_de_inclusion():
+    """La tabla nombra la ruta completa, no sólo el blob: ``main.a.x``."""
+    status, salida, _ = _correr(["-c", "blob main:\n    blob a:\n        x = 1\n", "-p"])
+    assert status == 0
+    assert "rutas de inclusión" in salida
+    assert "main.a.x" in salida

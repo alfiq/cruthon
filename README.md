@@ -72,7 +72,7 @@ Dos comandos de diagnóstico (no forman parte del lenguaje):
 | Comando | Qué hace |
 | --- | --- |
 | `%blobs` | lista los blobs vivos |
-| `%pertenencia [blob]` | imprime la tabla de pertenencia (nombre → blobs donde vive) |
+| `%pertenencia [blob]` | imprime la tabla de pertenencia (nombre → rutas de inclusión) |
 
 ## El lenguaje
 
@@ -176,9 +176,9 @@ sin tener que prohibirse la clase.
 
 ### La tabla de pertenencia
 
-Cada blob mantiene una tabla que dice **en qué blobs vive cada nombre**. Es el
-sustituto del MRO de CPython: en vez de una cadena lineal de herencia, cada
-nombre dice dónde está.
+Cada blob mantiene una tabla que dice **en qué regiones vive cada nombre**,
+escritas como rutas de inclusión. Es el sustituto del MRO de CPython: en vez
+de una cadena lineal de herencia, cada nombre dice en qué región está.
 
 ```console
 $ cruthon -p -c "blob main:
@@ -187,12 +187,16 @@ $ cruthon -p -c "blob main:
 ...     blob b:
 ...         x = 2"
 
-Tabla de pertenencia (nombre -> blobs donde vive):
-  a: main
-  b: main
-  main: __main__
-  x: a, b
+Tabla de pertenencia (nombre -> rutas de inclusión):
+  a: main.a
+  b: main.b
+  main: main
+  x: main.a.x, main.b.x
 ```
+
+Las rutas baten a los nombres cortos justo donde hace falta: `main.a.x` y
+`main.b.x` son regiones distintas, así que leer `x` desnudo desde `main` es
+ambiguo y la tabla lo muestra antes de que el programa falle.
 
 ## Diferencias respecto a CPython estándar
 
@@ -240,6 +244,17 @@ una clase y una clase no es un blob.
   activo, Cruthon lanza `ScopeError` (un `RuntimeError`) en vez de un
   `AttributeError` o un `NameError`. El nombre existe en el programa, pero
   en otro blob: es un problema de geometría, no de jerarquía.
+* **La ambigüedad.** Un nombre puede vivir en dos áreas a la misma distancia
+  (`y` en `A` y en `B`, vistas desde `main`). Ahí no se elige una por orden
+  de declaración: se lanza `AmbiguousName` (un `ScopeError`) con las rutas de
+  inclusión que compiten, `A.y` y `B.y` (escritas desde donde se lee), y el
+  aviso de calificar con la ruta de inclusión. Cuando las distancias son
+  distintas, gana la más cercana.
+* **La unicidad.** Un nombre es único dentro de su blob: dos regiones del
+  mismo blob no pueden compartirlo, y la segunda declaración falla en su
+  propia línea (`DuplicateName`), no donde después se usa el nombre. Una
+  región, en cambio, es única por su ruta de inclusión: `main.A.API` y
+  `main.B.API` son cosas distintas aunque las dos se llamen `API`.
 * **Los cuatro operadores.** `&`, `|`, `-` y `^` entre dos *blobs* ejecutan
   operaciones de conjuntos. Entre cualquier otro valor son los operadores
   bit a bit de Python, sin cambios.
@@ -312,10 +327,11 @@ desde cero en Python puro (sin bytecode, sin C):
 | [`cruthon/cli.py`](cruthon/cli.py) | `Programs/_freeze_module.c` | el ejecutable `cruthon` |
 
 La idea central del documento de diseño —sustituir el MRO por la resolución
-por pertenencia a conjuntos— está implementada en
-`Blob.membership_table()` y en `Blob.lookup()`: cuando un nombre no está en la
-tabla del blob activo ni en ninguna intersección alcanzable, el intérprete
-lanza un error de alcance.
+por pertenencia a conjuntos— está implementada en `Blob.inclusion_table()`
+(rutas de inclusión, la que imprime `-p`) y en `Blob.lookup()`, que recorre
+por distancias: gana la declaración más cercana, la ambigüedad a igual
+distancia es `AmbiguousName`, y un nombre que no vive en ninguna región
+alcanzable es un error de alcance.
 
 ## Ejemplos
 
@@ -346,7 +362,7 @@ Las decisiones y las buenas prácticas están en
 ## Pruebas
 
 ```bash
-python -m pytest            # 474 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
+python -m pytest            # 482 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
 ```
 
 ## El documento de diseño

@@ -93,5 +93,24 @@ class NameNotFound(ScopeError, NameError):
     """
 
 
+class AmbiguousName(ScopeError):
+    """El nombre vive en más de una región a la misma distancia.
+
+    No se elige una por orden de declaración: la lectura desnuda es ambigua y
+    el mensaje lista las rutas de inclusión que compiten, escritas desde el
+    blob donde se lee (``A.y`` y ``B.y`` dentro de ``main``; ``main.A.y`` y
+    ``main.B.y`` si la lectura es desde la raíz). Cuando las distancias son
+    distintas, gana la más cercana y este error no se lanza.
+    """
+
+
+class DuplicateName(CruthonSyntaxError):
+    """Dos regiones del mismo blob quieren el mismo nombre.
+
+    Hereda de ``CruthonSyntaxError`` para llevar archivo y línea: el error se
+    señala en la declaración duplicada, no en el uso que falla después.
+    """
+
+
 class BlobTypeError(CruthonRuntimeError):
     """Una operación de conjuntos recibió algo que no es un blob."""

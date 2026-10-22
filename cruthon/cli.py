@@ -84,8 +84,14 @@ def run_source(source: str, filename: str, show_membership: bool = False) -> int
 
 
 def _print_membership(interpreter: Interpreter) -> None:
-    table = interpreter.globals.membership_table()
-    print("\nTabla de pertenencia (nombre -> blobs donde vive):")
+    """Imprime la tabla de pertenencia con rutas de inclusión.
+
+    ``main.A.y`` y ``main.B.y`` son rutas distintas del mismo nombre ``y``:
+    si las dos existen, leerlo desnudo desde ``main`` es ambiguo, y la tabla
+    lo muestra en vez de invitar a adivinar cuál gana.
+    """
+    table = interpreter.globals.inclusion_table()
+    print("\nTabla de pertenencia (nombre -> rutas de inclusión):")
     if not table:
         print("  (vacío)")
     for name in sorted(table):

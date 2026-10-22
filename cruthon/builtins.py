@@ -12,10 +12,12 @@ import builtins as python_builtins
 from typing import Any, Dict
 
 from .errors import (
+    AmbiguousName,
     BlobTypeError,
     CruthonError,
     CruthonRuntimeError,
     CruthonSyntaxError,
+    DuplicateName,
     NameNotFound,
     ScopeError,
 )
@@ -127,12 +129,14 @@ BASE_EXCEPCIONES: Dict[str, Any] = {
 
 #: Errores propios de Cruthon: también se pueden capturar.
 ERRORES_CRUTHON: Dict[str, Any] = {
+    "AmbiguousName": AmbiguousName,
+    "BlobTypeError": BlobTypeError,
     "CruthonError": CruthonError,
     "CruthonRuntimeError": CruthonRuntimeError,
     "CruthonSyntaxError": CruthonSyntaxError,
-    "ScopeError": ScopeError,
+    "DuplicateName": DuplicateName,
     "NameNotFound": NameNotFound,
-    "BlobTypeError": BlobTypeError,
+    "ScopeError": ScopeError,
 }
 
 

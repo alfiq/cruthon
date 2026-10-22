@@ -14,7 +14,7 @@ import sys
 from typing import Any, List, Optional, Tuple
 
 from . import nodes as N
-from .errors import CruthonSyntaxError, IncompleteInput
+from .errors import CruthonSyntaxError, IncompleteInput, ScopeError
 from .interpreter import Interpreter
 from .parser import parse
 
@@ -185,12 +185,16 @@ class CruthonREPL:
         if command == "%pertenencia":
             target = self.interpreter.globals
             if len(parts) > 1:
-                ref = target.lookup(parts[1])
+                try:
+                    ref = target.lookup(parts[1])
+                except ScopeError as error:
+                    print(error, file=sys.stderr)
+                    return
                 if ref is None:
                     print(f"no existe el blob {parts[1]!r}", file=sys.stderr)
                     return
                 target = ref.get()
-            table = target.membership_table()
+            table = target.inclusion_table()
             if not table:
                 print("  (vacío)")
             for name in sorted(table):

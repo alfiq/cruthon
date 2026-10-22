@@ -42,6 +42,7 @@ from .errors import (
     CruthonRuntimeError,
     CruthonSyntaxError,
     CruthonTypeError,
+    DuplicateName,
     NameNotFound,
     ScopeError,
 )
@@ -540,6 +541,16 @@ class Interpreter:
         return None
 
     def _exec_blob_decl(self, node, blob, frame):
+        # Un nombre es único dentro de su blob: dos regiones del mismo blob no
+        # pueden compartirlo. Se falla en la declaración duplicada, que es
+        # donde está el error, y no donde después se usa el nombre.
+        if node.name in blob.declared_names():
+            raise DuplicateName(
+                f"ya vive un nombre {node.name!r} en el blob {blob.name!r}: "
+                "dos regiones del mismo blob no pueden compartir nombre",
+                self.filename,
+                node.lineno,
+            )
         if node.source is None:
             new_blob = Blob(node.name)
         else:
