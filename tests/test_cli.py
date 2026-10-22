@@ -71,6 +71,21 @@ def test_la_opcion_de_pertenencia_imprime_la_tabla():
     assert "x" in salida
 
 
+def test_la_primera_linea_del_archivo_se_ejecuta(tmp_path):
+    """Un archivo cuyo primer renglón es código no pierde ese renglón.
+
+    La detección de codificación lee las primeras líneas del archivo para
+    buscar la declaración ``# -*- coding: ... -*-``; si no se vuelve al
+    principio, el programa empieza en la segunda línea y esa sentencia se
+    ejecuta como si no existiera.
+    """
+    archivo = tmp_path / "primera.cruthon"
+    archivo.write_text('print("primera")\nprint("segunda")\n', encoding="utf-8")
+    status, salida, error = _correr([str(archivo)])
+    assert status == 0, error
+    assert salida.splitlines() == ["primera", "segunda"]
+
+
 def test_version():
     with pytest.raises(SystemExit) as info:
         main(["--version"])

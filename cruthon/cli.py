@@ -101,6 +101,10 @@ def _leer(ruta: str) -> str:
     """
     with open(ruta, "rb") as handle:
         codificacion, _ = tokenize.detect_encoding(handle.readline)
+        # ``detect_encoding`` consume las líneas que lee para buscar la
+        # declaración: hay que volver al principio o se pierde la primera
+        # línea del programa (y con ella, una sentencia que sí existe).
+        handle.seek(0)
         return handle.read().decode(codificacion)
 
 

@@ -1,0 +1,1203 @@
+# Venn: un servidor web escrito en Cruthon.
+#
+# No hay clases en este archivo: la aplicación son cinco blobs y una
+# intersección, exactamente el caso de uso del documento de diseño.
+#
+#     main
+#       transporte   sockets y HTTP: leer la petición, escribir la respuesta
+#       api          validación y cálculo; devuelve datos, nunca HTML
+#       sitio        el front end: arma el HTML que ve el navegador
+#       estado       = api & sitio  -> el ÚNICO punto de contacto entre los dos
+#       bitacora     una línea por petición, por stderr
+#       servidor     = transporte | bitacora  -> mismo proceso, sin memoria común
+#
+# `api` no ve `sitio` y `sitio` no ve `api`: cada uno escribe sus funciones
+# con el ámbito de su propio blob. Lo único que ambos tocan es `estado`, que
+# existe porque es la intersección. `transporte` y `bitacora` no comparten
+# memoria: la unión sólo dice que corren bajo el mismo proceso.
+#
+# Se ejecuta desde la raíz del repositorio:
+#
+#     python -m cruthon examples/web/servidor.cruthon
+#     CRUTHON_PUERTO=9000 python -m cruthon examples/web/servidor.cruthon
+#
+# La aplicación: dos conjuntos escritos por quien visita la página se
+# combinan con los cuatro operadores (intersección, unión, diferencia y
+# diferencia simétrica). El formulario funciona sin JavaScript; el guion
+# sólo mejora la respuesta cuando el navegador lo permite.
+
+blob main:
+
+    # ------------------------------------------------------------------
+    # transporte: el sobre HTTP. No sabe nada de conjuntos ni de HTML.
+    # ------------------------------------------------------------------
+    blob transporte:
+        import socket
+        import sys
+        from email.utils import formatdate
+        from urllib.parse import parse_qs, unquote
+
+        # Un servidor que no acota lo que lee se puede tumbar con una
+        # petición: estos límites son la primera defensa.
+        MAX_LINEA = 8192
+        MAX_CABECERAS = 100
+        MAX_CUERPO = 8192
+        #: El servidor atiende una conexión por vez: una espera corta evita
+        #: que una conexión abierta y muda (el preconnect del navegador)
+        #: retenga la siguiente petición.
+        ESPERA_RED = 2.0
+        ATRASO = 16
+
+        MOTIVOS = {
+            200: "OK",
+            204: "No Content",
+            303: "See Other",
+            400: "Bad Request",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            408: "Request Timeout",
+            411: "Length Required",
+            413: "Content Too Large",
+            415: "Unsupported Media Type",
+            431: "Request Header Fields Too Large",
+            500: "Internal Server Error",
+            501: "Not Implemented",
+        }
+
+        # Cabeceras que van en todas las respuestas. La política de
+        # contenido prohíbe el estilo y el guion en línea: por eso la hoja y
+        # el guion se sirven como archivos, y una inyección en el HTML no
+        # puede ejecutar nada.
+        SEGURIDAD = [
+            ("X-Content-Type-Options", "nosniff"),
+            ("X-Frame-Options", "DENY"),
+            ("Referrer-Policy", "no-referrer"),
+            ("Cross-Origin-Opener-Policy", "same-origin"),
+            (
+                "Content-Security-Policy",
+                "default-src 'none'; style-src 'self'; script-src 'self'; "
+                "img-src 'self'; connect-src 'self'; form-action 'self'; "
+                "base-uri 'none'; frame-ancestors 'none'",
+            ),
+        ]
+
+        func motivo(codigo):
+            return MOTIVOS.get(codigo, "OK")
+
+        func abrir(puerto):
+            """Abre el socket de escucha en la interfaz local, o devuelve None.
+
+            Se escucha en 127.0.0.1 y no en 0.0.0.0: un servidor de ejemplo no
+            tiene por qué quedar expuesto a la red entera.
+            """
+            try:
+                escucha = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                escucha.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                escucha.bind(("127.0.0.1", puerto))
+                escucha.listen(ATRASO)
+                return escucha
+            except Exception as error:
+                print(f"No se pudo escuchar en el puerto {puerto}: {error}", file=sys.stderr)
+                return None
+
+        func leer(conexion):
+            """Lee una petición y devuelve ``{"error": ..., "peticion": ...}``."""
+            conexion.settimeout(ESPERA_RED)
+            crudo = b""
+            try:
+                while b"\r\n\r\n" not in crudo:
+                    trozo = conexion.recv(4096)
+                    if not trozo:
+                        return {"error": "conexion-vacia", "peticion": None}
+                    crudo += trozo
+                    if len(crudo) > MAX_LINEA + MAX_CABECERAS * 256:
+                        return {"error": "cabeceras-grandes", "peticion": None}
+            except socket.timeout:
+                return {"error": "tiempo-agotado", "peticion": None}
+
+            cabeza, cuerpo = crudo.split(b"\r\n\r\n", 1)
+            lineas = cabeza.split(b"\r\n")
+            if len(lineas) > MAX_CABECERAS + 1:
+                return {"error": "cabeceras-grandes", "peticion": None}
+
+            peticion = partir_peticion(lineas[0].decode("latin-1"))
+            if peticion is None:
+                return {"error": "peticion-ilegible", "peticion": None}
+
+            peticion["cabeceras"] = {}
+            for linea in lineas[1:]:
+                if b":" not in linea:
+                    return {"error": "peticion-ilegible", "peticion": None}
+                nombre, valor = linea.split(b":", 1)
+                clave = nombre.decode("latin-1").strip().lower()
+                peticion["cabeceras"][clave] = valor.decode("latin-1").strip()
+
+            if peticion["cabeceras"].get("transfer-encoding", "identity") != "identity":
+                return {"error": "codificacion-no-soportada", "peticion": None}
+
+            try:
+                declarado = int(peticion["cabeceras"].get("content-length", "0"))
+            except ValueError:
+                return {"error": "peticion-ilegible", "peticion": None}
+            if declarado < 0:
+                return {"error": "peticion-ilegible", "peticion": None}
+            if declarado > MAX_CUERPO:
+                return {"error": "cuerpo-demasiado-grande", "peticion": None}
+
+            try:
+                while len(cuerpo) < declarado:
+                    trozo = conexion.recv(4096)
+                    if not trozo:
+                        break
+                    cuerpo += trozo
+            except socket.timeout:
+                return {"error": "tiempo-agotado", "peticion": None}
+
+            peticion["cuerpo"] = cuerpo[:declarado].decode("utf-8", "replace")
+            return {"error": None, "peticion": peticion}
+
+        func partir_peticion(linea):
+            """``GET /ruta?x=1 HTTP/1.1`` -> método, camino y consulta."""
+            partes = linea.split(" ")
+            if len(partes) != 3:
+                return None
+            metodo = partes[0].upper()
+            destino = partes[1]
+            version = partes[2]
+            if not version.startswith("HTTP/1."):
+                return None
+            if metodo not in ("GET", "HEAD", "POST"):
+                return {"metodo": metodo, "camino": "", "consulta": ""}
+
+            if "?" in destino:
+                camino, consulta = destino.split("?", 1)
+            else:
+                camino, consulta = destino, ""
+            return {
+                "metodo": metodo,
+                "camino": unquote(camino),
+                "consulta": consulta,
+            }
+
+        func formulario(cuerpo):
+            """Decodifica ``application/x-www-form-urlencoded`` en un dict."""
+            campos = {}
+            for nombre, valores in parse_qs(cuerpo, keep_blank_values=True).items():
+                campos[nombre] = valores[0]
+            return campos
+
+        func responder(conexion, respuesta, con_cuerpo):
+            """Serializa una respuesta y la envía. Un solo lugar, una sola forma."""
+            cuerpo = respuesta["cuerpo"].encode("utf-8")
+            lineas = [
+                f"HTTP/1.1 {respuesta['estado']} {motivo(respuesta['estado'])}",
+                f"Date: {formatdate(usegmt=True)}",
+                "Server: venn-cruthon",
+                f"Content-Type: {respuesta['tipo']}",
+                f"Content-Length: {len(cuerpo)}",
+                f"Cache-Control: {respuesta['cache']}",
+                "Connection: close",
+            ]
+            for nombre, valor in SEGURIDAD:
+                lineas.append(f"{nombre}: {valor}")
+            for nombre, valor in respuesta["cabeceras"].items():
+                lineas.append(f"{nombre}: {valor}")
+            cabeza = ("\r\n".join(lineas) + "\r\n\r\n").encode("latin-1")
+            if con_cuerpo:
+                conexion.sendall(cabeza + cuerpo)
+            else:
+                conexion.sendall(cabeza)
+
+    # ------------------------------------------------------------------
+    # api: cálculo y validación. Devuelve datos; no sabe qué es una etiqueta.
+    # ------------------------------------------------------------------
+    blob api:
+        import json
+        import time
+
+        MAX_ELEMENTOS = 64
+        MAX_LARGO = 40
+        HISTORIAL = 10
+
+        func separar(texto):
+            """Texto libre -> conjunto: una línea, o una coma, por elemento.
+
+            Se ordena y se deduplica porque un conjunto no tiene orden ni
+            repeticiones; lo que se muestra es el conjunto, no el texto.
+            """
+            piezas = []
+            for linea in texto.replace(",", "\n").split("\n"):
+                limpio = linea.strip()
+                if limpio != "":
+                    piezas.append(limpio)
+            return sorted(set(piezas))
+
+        func validar(nombre, elementos):
+            """Devuelve el mensaje de error, o None si el conjunto sirve."""
+            if len(elementos) > MAX_ELEMENTOS:
+                return f"El conjunto {nombre} tiene {len(elementos)} elementos; el máximo es {MAX_ELEMENTOS}."
+            for elemento in elementos:
+                if len(elemento) > MAX_LARGO:
+                    return f"Cada elemento de {nombre} puede tener hasta {MAX_LARGO} caracteres."
+            return None
+
+        func calcular(a, b):
+            """Los cuatro operadores, con los conjuntos de verdad."""
+            izq = set(a)
+            der = set(b)
+            return {
+                "a": sorted(izq),
+                "b": sorted(der),
+                "interseccion": sorted(izq & der),
+                "union": sorted(izq | der),
+                "diferencia": sorted(izq - der),
+                "diferencia_simetrica": sorted(izq ^ der),
+            }
+
+        func operar(a, b, estado):
+            """Valida, calcula y deja el resultado en la zona compartida."""
+            error = validar("A", a)
+            if error is None:
+                error = validar("B", b)
+            if error is not None:
+                return {"error": error, "resultado": None, "momento": ""}
+
+            resultado = calcular(a, b)
+            momento = time.strftime("%H:%M:%S")
+            estado.ultimo = resultado
+            estado.operaciones += 1
+            estado.historial.append(
+                {
+                    "momento": momento,
+                    "a": resultado["a"],
+                    "b": resultado["b"],
+                    "union": len(resultado["union"]),
+                    "interseccion": len(resultado["interseccion"]),
+                }
+            )
+            while len(estado.historial) > HISTORIAL:
+                estado.historial.pop(0)
+            return {"error": None, "resultado": resultado, "momento": momento}
+
+        func entrada_json(cuerpo):
+            """Cuerpo JSON -> listas de textos, o un mensaje de error."""
+            try:
+                datos = json.loads(cuerpo)
+            except ValueError:
+                return {"error": "El cuerpo no es JSON válido.", "a": None, "b": None}
+            if not isinstance(datos, dict):
+                return {
+                    "error": "Se esperaba un objeto JSON con las claves a y b.",
+                    "a": None,
+                    "b": None,
+                }
+            a = datos.get("a", [])
+            b = datos.get("b", [])
+            if not isinstance(a, list) or not isinstance(b, list):
+                return {"error": "a y b tienen que ser listas de textos.", "a": None, "b": None}
+            for elemento in a + b:
+                if not isinstance(elemento, str):
+                    return {"error": "Cada elemento tiene que ser un texto.", "a": None, "b": None}
+            return {"error": None, "a": a, "b": b}
+
+        func json_de(datos, estado, cabeceras):
+            return {
+                "estado": estado,
+                "tipo": "application/json; charset=utf-8",
+                "cuerpo": json.dumps(datos, ensure_ascii=False),
+                "cache": "no-store",
+                "cabeceras": cabeceras,
+            }
+
+        func respuesta_operacion(resultado, momento, operaciones):
+            datos = {
+                "a": resultado["a"],
+                "b": resultado["b"],
+                "interseccion": resultado["interseccion"],
+                "union": resultado["union"],
+                "diferencia": resultado["diferencia"],
+                "diferencia_simetrica": resultado["diferencia_simetrica"],
+                "momento": momento,
+                "operaciones": operaciones,
+            }
+            return json_de(datos, 200, {"Content-Language": "es"})
+
+        func respuesta_error(mensaje):
+            return json_de({"mensaje": mensaje}, 400, {"Content-Language": "es"})
+
+        func respuesta_estado(estado):
+            datos = {
+                "inicio": estado.inicio,
+                "operaciones": estado.operaciones,
+                "ultimo": estado.ultimo,
+                "historial": estado.historial,
+            }
+            return json_de(datos, 200, {"Content-Language": "es"})
+
+    # ------------------------------------------------------------------
+    # sitio: el front end. Recibe datos y devuelve HTML; no calcula nada.
+    # ------------------------------------------------------------------
+    blob sitio:
+        import html
+
+        DESCRIPCION = (
+            "Venn: un laboratorio de conjuntos servido por Cruthon. "
+            "Escribe dos conjuntos y compara su intersección, unión, "
+            "diferencia y diferencia simétrica."
+        )
+
+        #: Versión de los estáticos. Cambiarla invalida la caché del navegador
+        #: sin tocar los `max-age`: es el cache busting de toda la vida.
+        VERSION = "2"
+
+        HOJA = """
+:root {
+  color-scheme: light dark;
+  --fondo: #f7f6f3;
+  --tinta: #1b1a17;
+  --tenue: #5d5a52;
+  --linea: #d9d5cc;
+  --papel: #fffefb;
+  --acento: #b4472b;
+  --acento-suave: #f2e2dc;
+  --radio: 14px;
+  --ancho: 62rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fondo: #16151a;
+    --tinta: #f2efe8;
+    --tenue: #a9a49a;
+    --linea: #322f38;
+    --papel: #1e1d23;
+    --acento: #e8836a;
+    --acento-suave: #352421;
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* Una clase con display propio gana al [hidden] del navegador: sin esta
+   regla, ocultar una tarjeta o una lista no la oculta de verdad. */
+[hidden] { display: none !important; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--fondo);
+  color: var(--tinta);
+  font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.55;
+}
+
+.salto {
+  position: absolute;
+  left: -999px;
+  top: 0;
+  background: var(--papel);
+  padding: 0.6rem 1rem;
+  border-radius: 0 0 var(--radio) 0;
+  z-index: 10;
+}
+
+.salto:focus { left: 0; }
+
+.cabecera,
+main,
+.pie {
+  width: min(100% - 2.5rem, var(--ancho));
+  margin-inline: auto;
+}
+
+.cabecera { padding: 3rem 0 1.5rem; }
+
+.marca {
+  margin: 0;
+  font-size: 0.8rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--acento);
+}
+
+h1 {
+  margin: 0.2rem 0 0.4rem;
+  font-size: clamp(2rem, 5vw, 2.9rem);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.entrada {
+  margin: 0;
+  max-width: 46ch;
+  color: var(--tenue);
+}
+
+.formulario {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  align-items: start;
+  margin-block: 1.5rem 2rem;
+}
+
+.campo { display: flex; flex-direction: column; gap: 0.35rem; }
+
+label { font-weight: 600; }
+
+textarea {
+  width: 100%;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--linea);
+  border-radius: var(--radio);
+  background: var(--papel);
+  color: inherit;
+  font: inherit;
+  font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", monospace;
+  resize: vertical;
+}
+
+.ayuda,
+.cuenta,
+.vacio,
+.pie {
+  color: var(--tenue);
+}
+
+.ayuda { margin: 0; font-size: 0.82rem; }
+
+.acciones {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  align-items: center;
+}
+
+button {
+  padding: 0.65rem 1.3rem;
+  border: 1px solid var(--acento);
+  border-radius: 999px;
+  background: var(--acento);
+  color: var(--papel);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover { filter: brightness(1.08); }
+
+:focus-visible {
+  outline: 3px solid var(--acento);
+  outline-offset: 2px;
+}
+
+.aviso {
+  margin: 0;
+  padding: 0.7rem 1rem;
+  border: 1px solid var(--acento);
+  border-radius: var(--radio);
+  background: var(--acento-suave);
+}
+
+.alerta { margin-block: 0 1rem; }
+
+.resultados {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tarjeta {
+  padding: 1rem 1.1rem;
+  border: 1px solid var(--linea);
+  border-radius: var(--radio);
+  background: var(--papel);
+}
+
+.tarjeta h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.simbolo {
+  font-size: 1.15rem;
+  color: var(--acento);
+}
+
+.elementos {
+  margin: 0;
+  padding-left: 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", monospace;
+  font-size: 0.92rem;
+}
+
+.cuenta { margin: 0.6rem 0 0; font-size: 0.8rem; }
+
+.vacio { margin: 0; font-size: 0.92rem; }
+
+section { margin-block: 2.5rem; }
+
+h2 {
+  margin: 0 0 0.9rem;
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+caption {
+  text-align: left;
+  color: var(--tenue);
+  font-size: 0.82rem;
+  padding-bottom: 0.4rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--linea);
+  vertical-align: top;
+}
+
+tbody tr:last-child td { border-bottom: 0; }
+
+.pie {
+  padding-block: 2rem 3rem;
+  font-size: 0.85rem;
+  border-top: 1px solid var(--linea);
+  margin-top: 2rem;
+}
+
+.pie p { margin: 0.3rem 0; }
+
+a { color: var(--acento); }
+
+code {
+  font-family: ui-monospace, "Cascadia Code", "SFMono-Regular", monospace;
+  font-size: 0.9em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+"""
+
+        GUION = r"""
+const formulario = document.querySelector(".formulario");
+const aviso = document.querySelector("[data-aviso]");
+const CAMPOS = ["interseccion", "union", "diferencia", "diferencia_simetrica"];
+
+function leer(texto) {
+  return texto
+    .split(",")
+    .join("\n")
+    .split("\n")
+    .map((parte) => parte.trim())
+    .filter((parte) => parte !== "");
+}
+
+function contar(n) {
+  return n === 1 ? "1 elemento" : n + " elementos";
+}
+
+function mostrarAviso(mensaje) {
+  if (!aviso) return;
+  aviso.textContent = mensaje;
+  aviso.hidden = mensaje === "";
+}
+
+function ocultar(selector) {
+  const nodo = document.querySelector(selector);
+  if (nodo) nodo.hidden = true;
+}
+
+function celda(texto) {
+  const nodo = document.createElement("td");
+  nodo.textContent = texto;
+  return nodo;
+}
+
+function anotarEnHistorial(datos) {
+  const cuerpo = document.querySelector("[data-historial]");
+  if (!cuerpo) return;
+  const fila = document.createElement("tr");
+  fila.append(
+    celda(datos.momento),
+    celda(String((datos.a || []).length)),
+    celda(String((datos.b || []).length)),
+    celda(String((datos.interseccion || []).length)),
+    celda(String((datos.union || []).length))
+  );
+  cuerpo.prepend(fila);
+  while (cuerpo.children.length > 10) {
+    cuerpo.lastElementChild.remove();
+  }
+  ocultar("[data-sin-historial]");
+}
+
+function pintar(datos) {
+  for (const campo of CAMPOS) {
+    const lista = document.querySelector('[data-lista="' + campo + '"]');
+    const vacio = document.querySelector('[data-vacio="' + campo + '"]');
+    const cuenta = document.querySelector('[data-cuenta="' + campo + '"]');
+    const elementos = datos[campo] || [];
+    if (lista) {
+      lista.replaceChildren(
+        ...elementos.map((texto) => {
+          const item = document.createElement("li");
+          item.textContent = texto;
+          return item;
+        })
+      );
+      lista.hidden = elementos.length === 0;
+    }
+    if (vacio) vacio.hidden = elementos.length > 0;
+    if (cuenta) cuenta.textContent = contar(elementos.length);
+  }
+  const contenedor = document.querySelector(".resultados");
+  if (contenedor) contenedor.hidden = false;
+  ocultar("[data-sin-resultado]");
+  anotarEnHistorial(datos);
+  for (const total of document.querySelectorAll("[data-operaciones]")) {
+    total.textContent = datos.operaciones;
+  }
+}
+
+async function calcular(evento) {
+  evento.preventDefault();
+  const datos = new FormData(formulario);
+  const cuerpo = {
+    a: leer(String(datos.get("a") || "")),
+    b: leer(String(datos.get("b") || "")),
+  };
+  mostrarAviso("");
+  formulario.setAttribute("aria-busy", "true");
+  try {
+    const respuesta = await fetch("/api/operar", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cuerpo),
+    });
+    const resultado = await respuesta.json();
+    if (!respuesta.ok) {
+      mostrarAviso(resultado.mensaje || "No se pudo calcular.");
+      return;
+    }
+    pintar(resultado);
+  } catch (fallo) {
+    mostrarAviso("No se pudo contactar con el servidor; vuelve a intentarlo.");
+  } finally {
+    formulario.removeAttribute("aria-busy");
+  }
+}
+
+if (formulario) {
+  formulario.addEventListener("submit", calcular);
+}
+"""
+
+        ICONO = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Venn">
+<rect width="32" height="32" rx="8" fill="#b4472b"/>
+<circle cx="13" cy="16" r="7" fill="none" stroke="#fffefb" stroke-width="2"/>
+<circle cx="19" cy="16" r="7" fill="none" stroke="#fffefb" stroke-width="2"/>
+</svg>"""
+
+        func escapar(texto):
+            """Todo lo que escribe quien visita la página pasa por aquí."""
+            return html.escape(texto, quote=True)
+
+        func plural(n):
+            if n == 1:
+                return "1 elemento"
+            return f"{n} elementos"
+
+        func tarjeta(titulo, simbolo, campo, elementos):
+            if len(elementos) == 0:
+                cuerpo = f'<ul class="elementos" data-lista="{campo}" hidden></ul>'
+                cuerpo += f'<p class="vacio" data-vacio="{campo}">∅ conjunto vacío</p>'
+            else:
+                cuerpo = f'<ul class="elementos" data-lista="{campo}">'
+                for elemento in elementos:
+                    cuerpo += f"<li>{escapar(elemento)}</li>"
+                cuerpo += "</ul>"
+                cuerpo += f'<p class="vacio" data-vacio="{campo}" hidden>∅ conjunto vacío</p>'
+            return f"""
+          <article class="tarjeta">
+            <h3><span class="simbolo" aria-hidden="true">{simbolo}</span> {titulo}</h3>
+            {cuerpo}
+            <p class="cuenta" data-cuenta="{campo}">{plural(len(elementos))}</p>
+          </article>"""
+
+        func cabeza():
+            return f"""<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Venn — laboratorio de conjuntos</title>
+  <meta name="description" content="{escapar(DESCRIPCION)}">
+  <link rel="icon" href="/estatico/icono.svg?v={VERSION}" type="image/svg+xml">
+  <link rel="stylesheet" href="/estatico/hoja.css?v={VERSION}">
+  <script src="/estatico/app.js?v={VERSION}" defer></script>
+</head>
+<body>
+  <a class="salto" href="#contenido">Saltar al contenido</a>
+  <header class="cabecera">
+    <p class="marca">Cruthon</p>
+    <h1>Venn</h1>
+    <p class="entrada">{escapar(DESCRIPCION)}</p>
+  </header>
+  <main id="contenido">"""
+
+        func formulario(valor_a, valor_b):
+            return f"""
+    <form class="formulario" method="post" action="/operar">
+      <div class="campo">
+        <label for="conjunto-a">Conjunto A</label>
+        <textarea id="conjunto-a" name="a" rows="6" spellcheck="false"
+                  aria-describedby="ayuda-a">{escapar(valor_a)}</textarea>
+        <p class="ayuda" id="ayuda-a">Un elemento por línea, o separados por comas.</p>
+      </div>
+      <div class="campo">
+        <label for="conjunto-b">Conjunto B</label>
+        <textarea id="conjunto-b" name="b" rows="6" spellcheck="false"
+                  aria-describedby="ayuda-b">{escapar(valor_b)}</textarea>
+        <p class="ayuda" id="ayuda-b">Los repetidos no cuentan: es un conjunto.</p>
+      </div>
+      <div class="acciones">
+        <button type="submit">Calcular</button>
+        <p class="ayuda">El resultado también está en <code>/api/operar</code>.</p>
+      </div>
+    </form>"""
+
+        func resultados(ultimo):
+            # Las cuatro tarjetas se dibujan siempre, aunque no haya
+            # resultado: así el guion del navegador tiene dónde escribir sin
+            # volver a pedir la página. Con JavaScript desactivado, el
+            # formulario recarga y las pinta el servidor.
+            if ultimo is None:
+                base = {
+                    "interseccion": [],
+                    "union": [],
+                    "diferencia": [],
+                    "diferencia_simetrica": [],
+                }
+                nota = '<p class="vacio" data-sin-resultado>Todavía no hay operaciones: escribe dos conjuntos y pulsa «Calcular».</p>'
+                oculto = " hidden"
+            else:
+                base = ultimo
+                nota = '<p class="vacio" data-sin-resultado hidden>Todavía no hay operaciones: escribe dos conjuntos y pulsa «Calcular».</p>'
+                oculto = ""
+            return f"""
+    <section aria-labelledby="titulo-resultados">
+      <h2 id="titulo-resultados">Resultado</h2>
+      {nota}
+      <div class="resultados"{oculto}>
+        {tarjeta("Intersección", "∩", "interseccion", base["interseccion"])}
+        {tarjeta("Unión", "∪", "union", base["union"])}
+        {tarjeta("Diferencia A − B", "−", "diferencia", base["diferencia"])}
+        {tarjeta("Diferencia simétrica", "△", "diferencia_simetrica", base["diferencia_simetrica"])}
+      </div>
+    </section>"""
+
+        func historial(tabla, operaciones):
+            if len(tabla) == 0:
+                nota = '<p class="vacio" data-sin-historial>Sin operaciones todavía.</p>'
+            else:
+                nota = '<p class="vacio" data-sin-historial hidden>Sin operaciones todavía.</p>'
+            filas = []
+            for entrada in tabla:
+                momento = escapar(entrada["momento"])
+                tamano_a = len(entrada["a"])
+                tamano_b = len(entrada["b"])
+                comun = entrada["interseccion"]
+                juntos = entrada["union"]
+                filas.append(
+                    f"""
+              <tr>
+                <td><code>{momento}</code></td>
+                <td>{tamano_a}</td>
+                <td>{tamano_b}</td>
+                <td>{comun}</td>
+                <td>{juntos}</td>
+              </tr>"""
+                )
+            return f"""
+    <section aria-labelledby="titulo-historial">
+      <h2 id="titulo-historial">Historial</h2>
+      {nota}
+      <table>
+        <caption>Las últimas diez operaciones, contadas por tamaño del conjunto. Van <span data-operaciones>{operaciones}</span> en total.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Hora</th>
+            <th scope="col">|A|</th>
+            <th scope="col">|B|</th>
+            <th scope="col">|A ∩ B|</th>
+            <th scope="col">|A ∪ B|</th>
+          </tr>
+        </thead>
+        <tbody data-historial>{"".join(filas)}</tbody>
+      </table>
+    </section>"""
+
+        func pie(estado):
+            return f"""
+  </main>
+  <footer class="pie">
+    <p>Servido por Cruthon desde el blob <code>main</code>: <code>transporte | bitacora</code>, con <code>estado = api &amp; sitio</code> como única zona compartida.</p>
+    <p>Desde {escapar(estado.inicio)} van <span data-operaciones>{estado.operaciones}</span> operaciones. <a href="/salud">Estado</a> · <a href="/api/estado">API</a> · <a href="/estatico/hoja.css">Hoja</a></p>
+  </footer>
+</body>
+</html>
+"""
+
+        func inicio(estado, error, valor_a, valor_b, codigo, ok):
+            aviso = ""
+            if error is not None:
+                aviso = f"""
+    <div class="alerta">
+      <p class="aviso" role="alert" data-aviso>{escapar(error)}</p>
+    </div>"""
+            else:
+                aviso = """
+    <div class="alerta">
+      <p class="aviso" role="alert" data-aviso hidden></p>
+    </div>"""
+            if ok:
+                aviso += """
+    <p class="vacio">Listo: el resultado está abajo.</p>"""
+            cuerpo = (
+                cabeza()
+                + aviso
+                + formulario(valor_a, valor_b)
+                + resultados(estado.ultimo)
+                + historial(estado.historial, estado.operaciones)
+                + pie(estado)
+            )
+            return {
+                "estado": codigo,
+                "tipo": "text/html; charset=utf-8",
+                "cuerpo": cuerpo,
+                "cache": "no-store",
+                "cabeceras": {"Content-Language": "es"},
+            }
+
+        func error(codigo, titulo, detalle):
+            cuerpo = f"""{cabeza()}
+    <section>
+      <h2>{escapar(titulo)}</h2>
+      <p class="vacio">{escapar(detalle)}</p>
+      <p><a href="/">Volver a Venn</a></p>
+    </section>
+  </main>
+  <footer class="pie">
+    <p>Cruthon · Venn</p>
+  </footer>
+</body>
+</html>
+"""
+            return {
+                "estado": codigo,
+                "tipo": "text/html; charset=utf-8",
+                "cuerpo": cuerpo,
+                "cache": "no-store",
+                "cabeceras": {"Content-Language": "es"},
+            }
+
+        func hoja():
+            return {
+                "estado": 200,
+                "tipo": "text/css; charset=utf-8",
+                "cuerpo": HOJA,
+                "cache": "public, max-age=300",
+                "cabeceras": {},
+            }
+
+        func guion():
+            return {
+                "estado": 200,
+                "tipo": "text/javascript; charset=utf-8",
+                "cuerpo": GUION,
+                "cache": "public, max-age=300",
+                "cabeceras": {},
+            }
+
+        func icono():
+            return {
+                "estado": 200,
+                "tipo": "image/svg+xml",
+                "cuerpo": ICONO,
+                "cache": "public, max-age=86400",
+                "cabeceras": {},
+            }
+
+    # ------------------------------------------------------------------
+    # estado: la intersección. Lo único que api y sitio comparten.
+    # ------------------------------------------------------------------
+    blob estado = api & sitio:
+        historial = []
+        ultimo = None
+        operaciones = 0
+        inicio = ""
+
+    # ------------------------------------------------------------------
+    # bitacora: una línea por petición, a stderr.
+    # ------------------------------------------------------------------
+    blob bitacora:
+        import sys
+        import time
+
+        func nota(texto):
+            print(f"[venn] {texto}", file=sys.stderr, flush=True)
+
+        func anotar(metodo, camino, codigo, milisegundos):
+            print(
+                f"[venn] {time.strftime('%H:%M:%S')} {metodo} {camino} -> {codigo} ({milisegundos:.1f} ms)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------
+    # servidor: transporte y bitacora corriendo juntos, sin memoria común.
+    # ------------------------------------------------------------------
+    blob servidor = transporte | bitacora:
+        import os
+        import sys
+        import time
+
+        PUERTO_POR_DEFECTO = 8099
+
+        # La tabla de rutas: (método, camino) -> nombre del recurso. Un
+        # camino que no está aquí no existe, y eso es todo el enrutador.
+        rutas = {
+            ("GET", "/"): "inicio",
+            ("HEAD", "/"): "inicio",
+            ("POST", "/operar"): "operar_formulario",
+            ("POST", "/api/operar"): "operar_json",
+            ("GET", "/api/estado"): "estado_json",
+            ("GET", "/salud"): "salud",
+            ("GET", "/estatico/hoja.css"): "hoja",
+            ("GET", "/estatico/app.js"): "guion",
+            ("GET", "/estatico/icono.svg"): "icono",
+        }
+
+        func puerto():
+            """El puerto sale del entorno; si no se puede leer, el de siempre."""
+            texto = os.environ.get("CRUTHON_PUERTO", f"{PUERTO_POR_DEFECTO}")
+            if not texto.isdigit():
+                return -1
+            return int(texto)
+
+        func permitidos_para(camino):
+            metodos = []
+            for metodo, ruta in rutas:
+                if ruta == camino:
+                    metodos.append(metodo)
+            return metodos
+
+        func despachar(peticion, estado, api, sitio):
+            """De petición a respuesta. Aquí se decide el código de estado."""
+            metodo = peticion["metodo"]
+            camino = peticion["camino"]
+            recurso = rutas.get((metodo, camino))
+
+            if recurso is None:
+                permitidos = permitidos_para(camino)
+                if len(permitidos) > 0:
+                    respuesta = sitio.error(
+                        405,
+                        "Método no permitido",
+                        f"Para {camino} se puede usar: {', '.join(permitidos)}.",
+                    )
+                    respuesta["cabeceras"]["Allow"] = ", ".join(permitidos)
+                    return respuesta
+                return sitio.error(
+                    404,
+                    "No encontrado",
+                    f"{camino} no existe en este servidor.",
+                )
+
+            if recurso == "inicio":
+                ok = "ok" in peticion["consulta"]
+                return sitio.inicio(estado, None, "", "", 200, ok)
+
+            if recurso == "hoja":
+                return sitio.hoja()
+
+            if recurso == "guion":
+                return sitio.guion()
+
+            if recurso == "icono":
+                return sitio.icono()
+
+            if recurso == "salud":
+                return api.json_de(
+                    {
+                        "estado": "ok",
+                        "servidor": "venn-cruthon",
+                        "operaciones": estado.operaciones,
+                    },
+                    200,
+                    {},
+                )
+
+            if recurso == "estado_json":
+                return api.respuesta_estado(estado)
+
+            if recurso == "operar_formulario":
+                campos = transporte.formulario(peticion["cuerpo"])
+                valor_a = campos.get("a", "")
+                valor_b = campos.get("b", "")
+                salida = api.operar(
+                    api.separar(valor_a),
+                    api.separar(valor_b),
+                    estado,
+                )
+                if salida["error"] is not None:
+                    return sitio.inicio(estado, salida["error"], valor_a, valor_b, 400, False)
+                # POST/redirect/GET: recargar la página no repite la operación.
+                return {
+                    "estado": 303,
+                    "tipo": "text/html; charset=utf-8",
+                    "cuerpo": "",
+                    "cache": "no-store",
+                    "cabeceras": {"Location": "/?ok=1"},
+                }
+
+            if recurso == "operar_json":
+                tipo = peticion["cabeceras"].get("content-type", "")
+                if not tipo.startswith("application/json"):
+                    return api.json_de(
+                        {"mensaje": "Envía el cuerpo como application/json."},
+                        415,
+                        {"Accept": "application/json"},
+                    )
+                entrada = api.entrada_json(peticion["cuerpo"])
+                if entrada["error"] is not None:
+                    return api.respuesta_error(entrada["error"])
+                salida = api.operar(entrada["a"], entrada["b"], estado)
+                if salida["error"] is not None:
+                    return api.respuesta_error(salida["error"])
+                return api.respuesta_operacion(
+                    salida["resultado"],
+                    salida["momento"],
+                    estado.operaciones,
+                )
+
+            return sitio.error(500, "Error interno", "Ruta sin controlador.")
+
+        func respuesta_para_error(clave, sitio):
+            """Los errores de lectura del sobre HTTP, con su código correcto.
+
+            ``sitio`` llega como argumento, igual que ``estado``: el servidor
+            no ve el front end por pertenencia, así que se lo pasan.
+            """
+            if clave == "cabeceras-grandes":
+                return sitio.error(
+                    431,
+                    "Cabeceras demasiado grandes",
+                    "La petición pasa de lo que este servidor acepta.",
+                )
+            if clave == "cuerpo-demasiado-grande":
+                return sitio.error(
+                    413,
+                    "Cuerpo demasiado grande",
+                    "El formulario admite hasta 8 KiB.",
+                )
+            if clave == "codificacion-no-soportada":
+                return sitio.error(
+                    501,
+                    "Codificación no soportada",
+                    "Este servidor sólo entiende cuerpos con longitud declarada.",
+                )
+            if clave == "tiempo-agotado":
+                return sitio.error(408, "Tiempo agotado", "La petición llegó a medias.")
+            return sitio.error(
+                400,
+                "Petición ilegible",
+                "La primera línea o las cabeceras no tienen forma de HTTP.",
+            )
+
+        func atender(conexion, estado, api, sitio):
+            """Una petición, una conexión, cerrada al terminar."""
+            arranque = time.perf_counter()
+            metodo = "-"
+            camino = "-"
+            codigo = 500
+            try:
+                leido = transporte.leer(conexion)
+                if leido["error"] is not None:
+                    respuesta = respuesta_para_error(leido["error"], sitio)
+                    transporte.responder(conexion, respuesta, True)
+                    codigo = respuesta["estado"]
+                    return
+                peticion = leido["peticion"]
+                metodo = peticion["metodo"]
+                camino = peticion["camino"]
+                respuesta = despachar(peticion, estado, api, sitio)
+                codigo = respuesta["estado"]
+                transporte.responder(conexion, respuesta, metodo != "HEAD")
+            except Exception as error:
+                codigo = 500
+                try:
+                    transporte.responder(
+                        conexion,
+                        sitio.error(
+                            500,
+                            "Error interno",
+                            "Algo falló en el servidor; la bitácora tiene el detalle.",
+                        ),
+                        True,
+                    )
+                except Exception:
+                    pass
+                bitacora.nota(f"error en {metodo} {camino}: {type(error).__name__}: {error}")
+            finally:
+                try:
+                    conexion.close()
+                except Exception:
+                    pass
+                milisegundos = (time.perf_counter() - arranque) * 1000
+                bitacora.anotar(metodo, camino, codigo, milisegundos)
+
+        func iniciar(estado, api, sitio):
+            puerto_servidor = puerto()
+            if puerto_servidor < 0:
+                print("CRUTHON_PUERTO tiene que ser un número.", file=sys.stderr)
+                return 1
+            escucha = transporte.abrir(puerto_servidor)
+            if escucha is None:
+                return 1
+            estado.inicio = time.strftime("%H:%M:%S")
+            print(
+                f"Venn escuchando en http://127.0.0.1:{puerto_servidor} (Ctrl+C para parar)",
+                flush=True,
+            )
+            bitacora.nota("servidor arriba")
+            try:
+                while True:
+                    par = escucha.accept()
+                    atender(par[0], estado, api, sitio)
+            finally:
+                escucha.close()
+                bitacora.nota("servidor abajo")
+            return 0
+
+# La intersección y los blobs viven en `main`; el servidor corre en la unión
+# de transporte y bitácora, y recibe el estado como argumento: la misma
+# forma en que el PDF le pasa `carrito` a `frontend.dibujar_pagina`.
+servidor.iniciar(estado, api, sitio)

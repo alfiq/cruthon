@@ -65,3 +65,19 @@ frontend NO ve db -> el blob 'frontend' no expone el miembro 'db': no vive dentr
 Las dos últimas líneas son la prueba de la regla central del documento: el
 frontend ve el `total` que vive en la intersección `carrito`, pero no ve `db`,
 que vive dentro de `backend` (los blobs hermanos no se ven entre sí).
+
+## El servidor web
+
+[`web/servidor.cruthon`](web/servidor.cruthon) no sale del PDF, pero aplica su
+misma idea: es un servidor HTTP completo escrito en Cruthon, sin clases y sin
+`http.server`, con `transporte`, `api` y `sitio` como blobs separados y
+`estado = api & sitio` como única zona compartida. Sirve un front end
+(HTML generado, hoja de estilos y guion servidos por la misma tabla de rutas)
+y una API JSON.
+
+```bash
+python -m cruthon examples/web/servidor.cruthon   # http://127.0.0.1:8099
+```
+
+Las decisiones y las buenas prácticas están en
+[`web/README.md`](web/README.md).

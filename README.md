@@ -331,10 +331,22 @@ python tools/run_examples.py            # ejecuta y compara con lo guardado
 python tools/run_examples.py --update   # regenera los resultados
 ```
 
+Además de los siete ejemplos, [`examples/web/`](examples/web/) es un servidor
+HTTP escrito en Cruthon —sin clases— que sirve un front end y una API JSON,
+con `transporte`, `api` y `sitio` como blobs y `estado = api & sitio` como
+única zona compartida:
+
+```bash
+python -m cruthon examples/web/servidor.cruthon   # http://127.0.0.1:8099
+```
+
+Las decisiones y las buenas prácticas están en
+[`examples/web/README.md`](examples/web/README.md).
+
 ## Pruebas
 
 ```bash
-python -m pytest            # 457 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos y PDF
+python -m pytest            # 467 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
 ```
 
 ## El documento de diseño
