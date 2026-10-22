@@ -86,7 +86,9 @@ servidor.
 * `Content-Length` acotado: un cuerpo de más de 8 KiB se rechaza con 413
   antes de leerlo; cabeceras de más de 100 o una línea de petición enorme se
   rechazan con 431. Un servidor que no acota lo que lee se tumba con una
-  petición.
+  petición. Antes de cerrar el 413 se descarta un trozo acotado del cuerpo
+  (64 KiB), porque cerrar mientras el cliente escribe le llega como un
+  reinicio de conexión y se queda sin la respuesta.
 * Tiempo de espera de 5 s por operación de red y `Connection: close` en cada
   respuesta: nada de conexiones colgadas acumulándose.
 * `Date`, `Server`, `Content-Type` con `charset` y `Cache-Control` en todas

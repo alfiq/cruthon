@@ -42,6 +42,10 @@ blob main:
         MAX_LINEA = 8192
         MAX_CABECERAS = 100
         MAX_CUERPO = 8192
+        #: Cuánto cuerpo se descarta antes de cerrar por 413. Si se cierra sin
+        #: leer, el cliente que todavía está escribiendo recibe un reinicio de
+        #: conexión y se queda sin la respuesta.
+        MAX_DRENADO = 65536
         #: El servidor atiende una conexión por vez: una espera corta evita
         #: que una conexión abierta y muda (el preconnect del navegador)
         #: retenga la siguiente petición.
@@ -165,6 +169,7 @@ blob main:
             if declarado < 0:
                 return {"error": "peticion-ilegible", "peticion": None}
             if declarado > MAX_CUERPO:
+                drenar(conexion, cuerpo, declarado)
                 return {"error": "cuerpo-demasiado-grande", "peticion": None}
 
             try:
@@ -178,6 +183,24 @@ blob main:
 
             peticion["cuerpo"] = cuerpo[:declarado].decode("utf-8", "replace")
             return {"error": None, "peticion": peticion}
+
+        func drenar(conexion, cuerpo, declarado):
+            """Descarta el cuerpo sobrante, hasta un tope, antes de cerrar.
+
+            Cerrar con datos sin leer le llega al cliente como un reinicio de
+            conexión: se queda sin la respuesta 413. Se lee un máximo acotado
+            (``MAX_DRENADO``) para no convertir el rechazo en una lectura
+            infinita.
+            """
+            pendiente = min(declarado, MAX_DRENADO)
+            try:
+                while len(cuerpo) < pendiente:
+                    trozo = conexion.recv(min(4096, pendiente - len(cuerpo)))
+                    if not trozo:
+                        break
+                    cuerpo += trozo
+            except socket.timeout:
+                pass
 
         func partir_peticion(linea):
             """``GET /ruta?x=1 HTTP/1.1`` -> método, camino y consulta."""
