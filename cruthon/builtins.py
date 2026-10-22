@@ -98,18 +98,31 @@ EXCEPCIONES: Dict[str, Any] = {
         "ArithmeticError",
         "AssertionError",
         "AttributeError",
+        "ConnectionError",
         "Exception",
         "IndentationError",
         "IndexError",
         "KeyError",
         "NameError",
+        "OSError",
         "RuntimeError",
         "StopIteration",
         "SyntaxError",
+        "TimeoutError",
         "TypeError",
         "ValueError",
         "ZeroDivisionError",
     )
+}
+
+#: La única excepción visible que no hereda de ``Exception``.
+#:
+#: Un programa que abre un socket o atiende en un bucle necesita poder
+#: despedirse cuando llega Ctrl+C. Sin este nombre, la interrupción sale del
+#: intérprete como una traza; con él, el programa la captura y cierra lo que
+#: tenga abierto. ``except Exception`` no la captura, igual que en Python.
+BASE_EXCEPCIONES: Dict[str, Any] = {
+    "KeyboardInterrupt": python_builtins.KeyboardInterrupt,
 }
 
 #: Errores propios de Cruthon: también se pueden capturar.
@@ -164,6 +177,7 @@ def make_builtins() -> Dict[str, Any]:
     """Devuelve la tabla de builtin que ve cualquier blob."""
     tabla = dict(FUNCIONES)
     tabla.update(EXCEPCIONES)
+    tabla.update(BASE_EXCEPCIONES)
     tabla.update(ERRORES_CRUTHON)
     # ``isinstance`` y ``issubclass`` saben de las clases de Cruthon.
     tabla["isinstance"] = isinstance

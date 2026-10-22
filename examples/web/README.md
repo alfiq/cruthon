@@ -135,6 +135,16 @@ servidor.
 * `/salud` para saber si está arriba sin pedir la página.
 * Puerto configurable por entorno y `SO_REUSEADDR` para poder reiniciar sin
   esperar.
+* **Ctrl+C no es un fallo**: el bucle espera conexiones con un plazo de medio
+  segundo, `except KeyboardInterrupt` lo anota en la bitácora, el `finally`
+  cierra el socket y el proceso sale con 0, sin traza. Los errores de red se
+  capturan con `except OSError`, que es el tipo real de un puerto ocupado o
+  de una lectura interrumpida.
+* **Un puerto ocupado es un fracaso, y se nota**: se informa por `stderr` y
+  el proceso sale con 1. En Windows el socket usa `SO_EXCLUSIVEADDRUSE`
+  porque `SO_REUSEADDR` deja que un segundo proceso se quede con el mismo
+  puerto en silencio; en POSIX se usa `SO_REUSEADDR`, que sólo evita esperar
+  a `TIME_WAIT`.
 * Versión en la URL de los estáticos (`?v=1`) para poder cachearlos sin
   quedarse con una hoja vieja.
 

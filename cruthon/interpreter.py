@@ -958,7 +958,12 @@ class Interpreter:
                 self.exec_block(node.body, blob, frame)
             except (BreakSignal, ContinueSignal, ReturnSignal):
                 raise
-            except Exception as error:  # noqa: BLE001 - se re-lanza si no casa
+            # Se atrapa ``BaseException`` para que un ``except
+            # KeyboardInterrupt`` escrito en Cruthon pueda despedirse en vez
+            # de morir con una traza. ``except Exception`` sigue sin
+            # capturarla, porque el que decide es el handler, no esta línea:
+            # si ninguno casa, la excepción se relanza tal cual.
+            except BaseException as error:  # noqa: BLE001 - se re-lanza si no casa
                 handled = False
                 anterior = self.excepcion_actual
                 self.excepcion_actual = error

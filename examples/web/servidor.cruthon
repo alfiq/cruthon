@@ -92,12 +92,35 @@ blob main:
             """
             try:
                 escucha = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                escucha.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # En Windows, SO_REUSEADDR deja que un segundo proceso se
+                # quede con el mismo puerto en silencio y el puerto acaba
+                # repartido entre los dos. Ahí lo correcto es
+                # SO_EXCLUSIVEADDRUSE. En POSIX, REUSEADDR sólo evita esperar
+                # a que el puerto salga de TIME_WAIT.
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    escucha.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                else:
+                    escucha.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 escucha.bind(("127.0.0.1", puerto))
                 escucha.listen(ATRASO)
+                # Medio segundo por vuelta: una petición normal entra en
+                # microsegundos, y el plazo deja atender Ctrl+C a tiempo
+                # aunque no haya nadie conectándose.
+                escucha.settimeout(0.5)
                 return escucha
-            except Exception as error:
+            except OSError as error:
                 print(f"No se pudo escuchar en el puerto {puerto}: {error}", file=sys.stderr)
+                return None
+
+        func esperar(escucha):
+            """El siguiente par (conexión, dirección) o None si no llegó nada.
+
+            El plazo de ``accept`` no es un error: es la ocasión de mirar si
+            el proceso tiene una interrupción pendiente.
+            """
+            try:
+                return escucha.accept()
+            except socket.timeout:
                 return None
 
         func leer(conexion):
@@ -1190,14 +1213,27 @@ if (formulario) {
             bitacora.nota("servidor arriba")
             try:
                 while True:
-                    par = escucha.accept()
+                    par = transporte.esperar(escucha)
+                    if par is None:
+                        continue
                     atender(par[0], estado, api, sitio)
+            except KeyboardInterrupt:
+                # Ctrl+C no es un fallo: es la forma de parar. Se cierra el
+                # socket en el ``finally`` y se sale con código 0, sin traza.
+                bitacora.nota("interrumpido con el teclado")
             finally:
                 escucha.close()
                 bitacora.nota("servidor abajo")
+            print("Venn detenido.", flush=True)
             return 0
+
+import sys
 
 # La intersección y los blobs viven en `main`; el servidor corre en la unión
 # de transporte y bitácora, y recibe el estado como argumento: la misma
 # forma en que el PDF le pasa `carrito` a `frontend.dibujar_pagina`.
-servidor.iniciar(estado, api, sitio)
+codigo = servidor.iniciar(estado, api, sitio)
+if codigo != 0:
+    # Un servidor que no pudo escuchar no es un éxito: el proceso sale con
+    # el código del fallo, como haría un programa de Python.
+    sys.exit(codigo)

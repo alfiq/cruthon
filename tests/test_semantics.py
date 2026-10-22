@@ -20,7 +20,11 @@ Las reglas comprobadas son:
 from __future__ import annotations
 
 import io
+import os
+import subprocess
+import sys
 from contextlib import redirect_stdout
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -28,6 +32,8 @@ import pytest
 from cruthon import Interpreter, parse
 from cruthon.blobs import Blob
 from cruthon.errors import NameNotFound, ScopeError
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def ejecutar(source: str) -> str:
@@ -478,3 +484,107 @@ def test_the_blob_model_is_the_only_owner_of_the_resolution():
     assert isinstance(main, Blob)
     assert main.lookup("x").get() == 1
     assert main.lookup("inexistente") is None
+
+
+# ------------------------------------------------------------- excepciones
+
+OSERROR_DE_ARCHIVO = '''
+blob main:
+    func abrir():
+        try:
+            open("/no-existe-de-verdad/cruthon.txt")
+        except OSError as error:
+            print("archivo:", isinstance(error, OSError))
+
+abrir()
+'''
+
+OSERROR_DE_SOCKET = '''
+blob main:
+    import socket
+
+    func ocupar():
+        primero = socket.socket()
+        primero.bind(("127.0.0.1", 0))
+        puerto = primero.getsockname()[1]
+        segundo = socket.socket()
+        try:
+            segundo.bind(("127.0.0.1", puerto))
+        except OSError as error:
+            print("socket:", isinstance(error, OSError))
+        finally:
+            segundo.close()
+            primero.close()
+
+ocupar()
+'''
+
+CONNECTION_ERROR = '''
+blob main:
+    # Los dos nombres existen y son lo que dicen ser: subclases de OSError,
+    # que es lo que hace que ``except OSError`` los capture a los dos.
+    print("conexión:", issubclass(ConnectionError, OSError))
+    print("plazo:", issubclass(TimeoutError, OSError))
+'''
+
+INTERRUPCION = '''
+blob main:
+    func despedirse():
+        try:
+            raise KeyboardInterrupt()
+        except KeyboardInterrupt as error:
+            print("interrumpido:", type(error).__name__)
+
+despedirse()
+'''
+
+
+def test_oserror_captura_un_fallo_real_de_archivo():
+    """``open`` de un archivo que no existe lanza un ``OSError`` de verdad."""
+    assert ejecutar(OSERROR_DE_ARCHIVO).strip() == "archivo: True"
+
+
+def test_oserror_captura_un_fallo_real_de_socket():
+    """Dos sockets no pueden escuchar en el mismo puerto: eso es un OSError."""
+    assert ejecutar(OSERROR_DE_SOCKET).strip() == "socket: True"
+
+
+def test_connection_error_y_timeout_error_son_oserror():
+    """Los dos nombres nuevos son las clases de Python, no copias."""
+    assert ejecutar(CONNECTION_ERROR).split() == ["conexión:", "True", "plazo:", "True"]
+
+
+def test_keyboard_interrupt_se_puede_capturar_dentro_de_un_blob():
+    assert ejecutar(INTERRUPCION).strip() == "interrumpido: KeyboardInterrupt"
+
+
+def test_except_exception_no_captura_una_interrupcion(tmp_path):
+    """``KeyboardInterrupt`` no hereda de ``Exception``, como en Python.
+
+    El programa no la captura, así que sale del intérprete y termina con
+    error: lo comprobamos en un proceso aparte para no interrumpir las demás
+    pruebas.
+    """
+    archivo = tmp_path / "interrupcion.cruthon"
+    archivo.write_text(
+        "blob main:\n"
+        "    func correr():\n"
+        "        try:\n"
+        "            raise KeyboardInterrupt()\n"
+        "        except Exception:\n"
+        "            print('capturada')\n"
+        "\n"
+        "correr()\n",
+        encoding="utf-8",
+    )
+    proceso = subprocess.run(
+        [sys.executable, "-m", "cruthon", str(archivo)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+    )
+    assert proceso.returncode != 0
+    assert "capturada" not in proceso.stdout
+    assert "KeyboardInterrupt" in proceso.stderr

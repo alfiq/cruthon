@@ -8,16 +8,22 @@ es sobre la respuesta real, no sobre funciones internas del intérprete.
 
 from __future__ import annotations
 
+import _thread
 import http.client
+import io
 import json
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import pytest
+
+from cruthon.cli import main
 
 ROOT = Path(__file__).resolve().parent.parent
 SERVIDOR = ROOT / "examples" / "web" / "servidor.cruthon"
@@ -235,3 +241,73 @@ def test_head_devuelve_cabeceras_sin_cuerpo(servidor):
     assert cabeceras["content-type"] == "text/html; charset=utf-8"
     assert cuerpo == ""
     assert int(cabeceras["content-length"]) > 0
+
+
+def test_una_interrupcion_de_teclado_cierra_limpio(monkeypatch):
+    """Ctrl+C no deja una traza: el servidor cierra el socket y sale con 0.
+
+    La consola de este entorno no entrega eventos ``CTRL_C_EVENT`` (y un
+    grupo de procesos nuevo los ignora por diseño de Windows), así que la
+    interrupción se inyecta con ``_thread.interrupt_main()``: es el mismo
+    ``KeyboardInterrupt`` en el hilo principal que produce Ctrl+C, sin la
+    entrega del sistema operativo. El resto del camino --el ``except``, la
+    bitácora, el ``finally`` con ``close`` y el código de salida-- es el real.
+    """
+    puerto = puerto_libre()
+    monkeypatch.setenv("CRUTHON_PUERTO", str(puerto))
+    base = f"http://127.0.0.1:{puerto}"
+    salida, error = io.StringIO(), io.StringIO()
+    listo = threading.Event()
+    parar = threading.Event()
+    limite = time.time() + 20
+
+    def interrumpir():
+        while not parar.is_set() and time.time() < limite:
+            try:
+                if pedir(base, "/salud")[0] == 200:
+                    listo.set()
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+        if listo.is_set() and not parar.is_set():
+            _thread.interrupt_main()
+
+    hilo = threading.Thread(target=interrumpir, daemon=True)
+    hilo.start()
+    try:
+        with redirect_stdout(salida), redirect_stderr(error):
+            codigo = main([str(SERVIDOR)])
+    finally:
+        parar.set()
+        hilo.join(timeout=5)
+
+    assert listo.is_set(), "el servidor no llegó a escuchar"
+    assert codigo == 0
+    assert "Venn detenido." in salida.getvalue()
+    assert "interrumpido con el teclado" in error.getvalue()
+    assert "Traceback" not in error.getvalue()
+    # El socket se cerró: ya no hay nada escuchando en ese puerto.
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", puerto), timeout=1).close()
+
+
+def test_un_puerto_ocupado_falla_con_codigo_sin_traza(servidor):
+    """Si no puede escuchar, el proceso sale con 1 y lo dice, sin traza."""
+    puerto = int(servidor.rsplit(":", 1)[1])
+    entorno = dict(os.environ, CRUTHON_PUERTO=str(puerto), PYTHONIOENCODING="utf-8")
+    proceso = subprocess.run(
+        [sys.executable, "-m", "cruthon", str(SERVIDOR)],
+        cwd=str(ROOT),
+        env=entorno,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    assert proceso.returncode == 1
+    assert "No se pudo escuchar" in proceso.stderr
+    assert "Traceback" not in proceso.stderr
+    # El servidor que ya estaba escuchando no se enteró.
+    estado, _, _ = pedir(servidor, "/salud")
+    assert estado == 200

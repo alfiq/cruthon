@@ -346,7 +346,7 @@ Las decisiones y las buenas prácticas están en
 ## Pruebas
 
 ```bash
-python -m pytest            # 467 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
+python -m pytest            # 474 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
 ```
 
 ## El documento de diseño
