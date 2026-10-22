@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tokenize
 from typing import List, Optional
 
 from . import __version__
@@ -91,6 +92,18 @@ def _print_membership(interpreter: Interpreter) -> None:
         print(f"  {name}: {', '.join(table[name])}")
 
 
+def _leer(ruta: str) -> str:
+    """Lee un archivo respetando su declaración de codificación, como Python.
+
+    Se usa el mismo detector que CPython (PEP 263): una cookie
+    ``# -*- coding: latin-1 -*-`` en las dos primeras líneas o una marca BOM.
+    Sin declaración, el archivo se lee como UTF-8.
+    """
+    with open(ruta, "rb") as handle:
+        codificacion, _ = tokenize.detect_encoding(handle.readline)
+        return handle.read().decode(codificacion)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -103,11 +116,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.archivo:
         try:
-            with open(args.archivo, "r", encoding="utf-8") as handle:
-                source = handle.read()
+            source = _leer(args.archivo)
         except OSError as error:
             print(f"cruthon: no se pudo abrir {args.archivo!r}: {error}", file=sys.stderr)
             return 2
+        except UnicodeDecodeError as error:
+            print(
+                f"cruthon: no se pudo leer {args.archivo!r}: el archivo no está "
+                f"codificado en UTF-8 ({error.reason}). Añade una declaración "
+                f"'# -*- coding: cp1252 -*-' o conviértelo a UTF-8.",
+                file=sys.stderr,
+            )
+            return 1
+        except SyntaxError as error:
+            print(f"cruthon: {args.archivo!r}: {error}", file=sys.stderr)
+            return 1
         status = run_source(source, args.archivo, args.pertenencia)
         if args.interactivo:
             CruthonREPL().interact()

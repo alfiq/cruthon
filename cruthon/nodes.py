@@ -107,6 +107,11 @@ class Dict(Node):
 
 
 @dataclass
+class Starred(Node):
+    value: Any = None
+
+
+@dataclass
 class Slice(Node):
     lower: Any = None
     upper: Any = None
@@ -159,6 +164,22 @@ class FormattedValue(Node):
 
 
 @dataclass
+class NamedExpr(Node):
+    """Expresión de asignación ``(x := valor)``."""
+
+    target: Any = None
+    value: Any = None
+
+
+@dataclass
+class Yield(Node):
+    """``yield valor`` y ``yield from iterable``."""
+
+    value: Any = None
+    delegate: bool = False
+
+
+@dataclass
 class JoinedStr(Node):
     values: ListType[Any] = field(default_factory=list)
 
@@ -201,6 +222,18 @@ class FuncDef(Node):
     name: str = ""
     args: Any = None
     body: ListType[Any] = field(default_factory=list)
+    #: Los decoradores, en el orden en que se escribieron (``@arriba`` primero).
+    decorators: ListType[Any] = field(default_factory=list)
+
+
+@dataclass
+class ClassDef(Node):
+    """``class Nombre(Base):`` — una clase de Python, al lado de los blobs."""
+
+    name: str = ""
+    bases: ListType[Any] = field(default_factory=list)
+    body: ListType[Any] = field(default_factory=list)
+    #: Los decoradores, en el orden en que se escribieron.
     decorators: ListType[Any] = field(default_factory=list)
 
 
@@ -312,4 +345,28 @@ class Try(Node):
 class ExceptHandler(Node):
     type: Any = None
     name: Optional[str] = None
+    body: ListType[Any] = field(default_factory=list)
+
+
+@dataclass
+class Raise(Node):
+    """``raise``, ``raise Excepción`` y ``raise Excepción desde causa``."""
+
+    exc: Any = None
+    cause: Any = None
+
+
+@dataclass
+class WithItem(Node):
+    """Un elemento de un ``with``: el contexto y su destino opcional."""
+
+    context_expr: Any = None
+    optional_vars: Any = None
+
+
+@dataclass
+class With(Node):
+    """``with``: uno o varios gestores de contexto."""
+
+    items: ListType[Any] = field(default_factory=list)
     body: ListType[Any] = field(default_factory=list)

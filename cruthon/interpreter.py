@@ -18,13 +18,23 @@ Reglas que implementa (todas tomadas del documento de diseño):
 
 from __future__ import annotations
 
-import builtins
 import importlib
 import operator
+import queue
+import threading
 from typing import Any, Dict, List, Optional
 
 from . import nodes as N
 from .blobs import SET_FUNCTIONS, SET_OPERATIONS, Blob
+from .builtins import make_builtins
+from .classes import (
+    AUSENTE,
+    CruthonClass,
+    CruthonInstance,
+    CruthonMethod,
+    SuperFabrica,
+    buscar_metodo,
+)
 from .errors import (
     BlobTypeError,
     CruthonError,
@@ -54,7 +64,17 @@ class ContinueSignal(Exception):
 class Frame:
     """Marco de ejecución local de una función o comprensión."""
 
-    __slots__ = ("locals", "blob", "parent", "globals")
+    __slots__ = (
+        "locals",
+        "blob",
+        "parent",
+        "globals",
+        "nonlocals",
+        "is_class_body",
+        "owner_class",
+        "owner_instance",
+        "generator",
+    )
 
     def __init__(
         self,
@@ -66,102 +86,174 @@ class Frame:
         self.blob = blob
         self.parent = parent
         self.globals: set = set()
+        self.nonlocals: set = set()
+        #: ``True`` en el cuerpo de una clase: ahí los nombres se enlazan en
+        #: el espacio de nombres de la clase, no en el blob.
+        self.is_class_body = False
+        #: La clase a la que pertenece el método en curso (para ``super()``).
+        self.owner_class: Optional[CruthonClass] = None
+        #: La instancia del método en curso (para ``super()``).
+        self.owner_instance: Optional[CruthonInstance] = None
+        #: El generador que está ejecutando este marco, si lo hay.
+        self.generator: Optional["CruthonGenerator"] = None
 
 
 class CruthonFunction:
     """Función de Cruthon.
 
     Guarda el blob donde fue definida: ese es su ámbito, siempre, sin
-    importar quién la llame.
+    importar quién la llame. ``closure`` es el marco de la función que la
+    definió, si la hubo: las funciones anidadas ven las variables locales de
+    su entorno, como en Python.
+
+    Es además un *callable* de Python: implementa ``__call__``, de modo que
+    puede entregarse a un builtin de la biblioteca estándar (``map``,
+    ``filter``, ``sorted`` con ``key=``) sin adaptadores intermedios.
     """
 
-    __slots__ = ("name", "args", "body", "blob")
+    __slots__ = (
+        "name",
+        "args",
+        "body",
+        "blob",
+        "closure",
+        "interpreter",
+        "owner_class",
+        "is_generator",
+    )
 
-    def __init__(self, name: str, args: N.Arguments, body: List[Any], blob: Blob) -> None:
+    def __init__(
+        self,
+        name: str,
+        args: N.Arguments,
+        body: List[Any],
+        blob: Blob,
+        closure: Optional["Frame"] = None,
+        interpreter: Optional["Interpreter"] = None,
+        owner_class: Optional[CruthonClass] = None,
+    ) -> None:
         self.name = name
         self.args = args
         self.body = body
         self.blob = blob
+        self.closure = closure
+        self.interpreter = interpreter
+        #: La clase donde se definió el método (``None`` si es una función libre).
+        self.owner_class = owner_class
+        #: ``True`` si el cuerpo tiene un ``yield``: la función es generadora.
+        self.is_generator = _tiene_yield(body)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.interpreter is None:  # pragma: no cover - defensivo
+            raise CruthonRuntimeError(f"la función {self.name!r} no tiene intérprete")
+        return self.interpreter.call_function(self, list(args), dict(kwargs))
 
     def __repr__(self) -> str:
         return f"<func {self.name}>"
 
 
-def _make_builtins() -> Dict[str, Any]:
-    """Builtin de Python disponibles dentro de cualquier blob."""
-    table = {
-        "abs": builtins.abs,
-        "all": builtins.all,
-        "any": builtins.any,
-        "bin": builtins.bin,
-        "bool": builtins.bool,
-        "callable": builtins.callable,
-        "chr": builtins.chr,
-        "dict": builtins.dict,
-        "divmod": builtins.divmod,
-        "enumerate": builtins.enumerate,
-        "filter": builtins.filter,
-        "float": builtins.float,
-        "format": builtins.format,
-        "getattr": builtins.getattr,
-        "hasattr": builtins.hasattr,
-        "hash": builtins.hash,
-        "hex": builtins.hex,
-        "id": builtins.id,
-        "input": builtins.input,
-        "int": builtins.int,
-        "isinstance": builtins.isinstance,
-        "issubclass": builtins.issubclass,
-        "iter": builtins.iter,
-        "len": builtins.len,
-        "list": builtins.list,
-        "map": builtins.map,
-        "max": builtins.max,
-        "min": builtins.min,
-        "next": builtins.next,
-        "oct": builtins.oct,
-        "ord": builtins.ord,
-        "print": builtins.print,
-        "range": builtins.range,
-        "repr": builtins.repr,
-        "reversed": builtins.reversed,
-        "round": builtins.round,
-        "set": builtins.set,
-        "setattr": builtins.setattr,
-        "sorted": builtins.sorted,
-        "str": builtins.str,
-        "sum": builtins.sum,
-        "tuple": builtins.tuple,
-        "zip": builtins.zip,
-        "delattr": builtins.delattr,
-    }
-    for name in (
-        "ArithmeticError",
-        "AssertionError",
-        "AttributeError",
-        "Exception",
-        "IndexError",
-        "KeyError",
-        "NameError",
-        "RuntimeError",
-        "StopIteration",
-        "TypeError",
-        "ValueError",
-        "ZeroDivisionError",
-    ):
-        table[name] = getattr(builtins, name)
-    # Los errores propios de Cruthon también se pueden capturar.
-    table.update(
-        {
-            "CruthonError": CruthonError,
-            "CruthonRuntimeError": CruthonRuntimeError,
-            "CruthonSyntaxError": CruthonSyntaxError,
-            "ScopeError": ScopeError,
-            "NameNotFound": NameNotFound,
-            "BlobTypeError": BlobTypeError,
-        }
-    )
-    return table
+def _tiene_yield(body: List[Any]) -> bool:
+    """¿El cuerpo de la función contiene un ``yield``?
+
+    No se baja al cuerpo de las funciones anidadas: un ``yield`` dentro de
+    una función interna pertenece a esa función, como en Python.
+    """
+    return any(_nodo_tiene_yield(statement) for statement in body)
+
+
+def _nodo_tiene_yield(node: Any) -> bool:
+    if isinstance(node, N.Yield):
+        return True
+    if isinstance(node, (N.FuncDef, N.ClassDef, N.Lambda)):
+        return False
+    for valor in vars(node).values():
+        if isinstance(valor, list):
+            if any(isinstance(item, N.Node) and _nodo_tiene_yield(item) for item in valor):
+                return True
+        elif isinstance(valor, N.Node) and _nodo_tiene_yield(valor):
+            return True
+    return False
+
+
+class _Fin:
+    """Marca de fin del flujo de un generador."""
+
+    __slots__ = ()
+
+
+class CruthonGenerator:
+    """Generador de Cruthon: el cuerpo se ejecuta en un hilo aparte.
+
+    Cada ``yield`` entrega un valor y el hilo espera a que el consumidor pida
+    el siguiente. Así el generador se comporta como el de Python sin tener que
+    reescribir el evaluador entero como un generador: el hilo conserva el
+    punto exacto en el que quedó la ejecución.
+    """
+
+    def __init__(
+        self,
+        interpreter: "Interpreter",
+        function: CruthonFunction,
+        args: List[Any],
+        kwargs: Dict[str, Any],
+        owner_class: Optional[CruthonClass] = None,
+        owner_instance: Optional[CruthonInstance] = None,
+    ) -> None:
+        self._interpreter = interpreter
+        self._function = function
+        self._args = list(args)
+        self._kwargs = dict(kwargs)
+        self._owner_class = owner_class
+        self._owner_instance = owner_instance
+        self._valores: "queue.Queue[Any]" = queue.Queue()
+        self._peticiones: "queue.Queue[Any]" = queue.Queue()
+        self._error: Optional[BaseException] = None
+        self._retorno: Any = None
+        self._terminado = False
+        self._hilo = threading.Thread(target=self._correr, daemon=True)
+        self._hilo.start()
+
+    def _correr(self) -> None:
+        try:
+            self._retorno = self._interpreter._ejecutar_funcion(
+                self._function,
+                self._args,
+                self._kwargs,
+                owner_class=self._owner_class,
+                owner_instance=self._owner_instance,
+                generator=self,
+            )
+        except BaseException as error:  # noqa: BLE001 - se relanza al consumidor
+            self._error = error
+        finally:
+            self._valores.put(_Fin())
+
+    def emitir(self, valor: Any) -> None:
+        """Entrega un valor y espera a que el consumidor pida el siguiente."""
+        self._valores.put(valor)
+        self._peticiones.get()
+
+    def __iter__(self) -> "CruthonGenerator":
+        return self
+
+    def __next__(self) -> Any:
+        if self._terminado:
+            raise StopIteration(self._retorno)
+        item = self._valores.get()
+        if isinstance(item, _Fin):
+            self._terminado = True
+            if self._error is not None:
+                error, self._error = self._error, None
+                raise error
+            raise StopIteration(self._retorno)
+        self._peticiones.put(True)
+        return item
+
+    def close(self) -> None:
+        """Cierra el generador: el hilo que lo ejecuta termina."""
+        self._terminado = True
+        self._peticiones.put(True)
+        self._hilo.join(timeout=1.0)
 
 
 _BIN_OPS = {
@@ -196,7 +288,10 @@ class Interpreter:
     def __init__(self, filename: str = "<cruthon>") -> None:
         self.filename = filename
         self.globals = Blob("__main__")
-        self.builtins = _make_builtins()
+        self.builtins = make_builtins()
+        #: La excepción que se está manejando ahora mismo (para ``raise``
+        #: a secas).
+        self.excepcion_actual: Optional[BaseException] = None
 
     # -- programa -------------------------------------------------------
     def run(self, module: N.Module) -> Any:
@@ -236,9 +331,9 @@ class Interpreter:
 
     def _exec_blob_decl(self, node, blob, frame):
         if node.source is None:
-            new_blob = Blob(node.name, parent=blob)
+            new_blob = Blob(node.name)
         else:
-            new_blob = self.eval_blob_source(node.source, node.name, blob, frame)
+            new_blob = self._eval_blob_source(node.source, node.name, blob, frame)
             if not isinstance(new_blob, Blob):
                 raise BlobTypeError(
                     f"la expresión de 'blob {node.name}' debe producir un blob, "
@@ -255,9 +350,160 @@ class Interpreter:
         return None
 
     def _exec_func_def(self, node, blob, frame):
-        function = CruthonFunction(node.name, node.args, node.body, blob)
-        blob.define(node.name, function)
+        owner_class = frame.owner_class if frame is not None else None
+        function = CruthonFunction(
+            node.name, node.args, node.body, blob, frame, self, owner_class
+        )
+        if frame is not None and frame.is_class_body:
+            # Un método no cierra sobre el cuerpo de la clase: en Python,
+            # ``self.x`` es la forma de llegar al atributo, no el nombre
+            # desnudo. El ámbito del método es el blob donde se definió
+            # la clase.
+            function.closure = None
+        # Los decoradores se aplican de abajo hacia arriba, como en Python:
+        # ``@a @b`` es ``a(b(f))``.
+        for decorator in reversed(node.decorators or []):
+            function = self._aplicar_decorador(decorator, function, blob, frame)
+        if frame is not None:
+            # Como en Python, una función definida dentro de otra es una
+            # variable local de la que la define (y la puede cerrar).
+            frame.locals[node.name] = function
+        else:
+            blob.define(node.name, function)
         return None
+
+    def _aplicar_decorador(self, node, objetivo: Any, blob: Blob, frame: Optional[Frame]) -> Any:
+        """Aplica un decorador: ``decorador(objetivo)``."""
+        decorador = self.eval(node, blob, frame)
+        if not callable(decorador):
+            raise CruthonRuntimeError(
+                f"un decorador debe ser invocable, no {type(decorador).__name__}"
+            )
+        return self.call(decorador, [objetivo], {})
+
+    def _exec_class_def(self, node, blob, frame):
+        """Ejecuta ``class Nombre(Base):``."""
+        bases: List[CruthonClass] = []
+        bases_py: List[type] = []
+        for base_node in node.bases:
+            base = self.eval(base_node, blob, frame)
+            if isinstance(base, CruthonClass):
+                bases.append(base)
+            elif isinstance(base, type):
+                # Herencia de un tipo de Python (``class M(list):``): la
+                # clase se apoya en el comportamiento del tipo nativo.
+                bases_py.append(base)
+            else:
+                raise CruthonRuntimeError(
+                    "la base de una clase debe ser una clase, no "
+                    f"{type(base).__name__}"
+                )
+        namespace: Dict[str, Any] = {
+            "__name__": node.name,
+            "__qualname__": node.name,
+        }
+        clase = CruthonClass(node.name, bases, namespace, blob, bases_py)
+        # El cuerpo de la clase se ejecuta en su propio espacio de nombres,
+        # como en Python: lo que se define ahí son atributos de la clase.
+        class_frame = Frame(blob=blob, parent=frame)
+        class_frame.is_class_body = True
+        class_frame.owner_class = clase
+        class_frame.locals.update(namespace)
+        self.exec_block(node.body, blob, class_frame)
+        namespace.update(class_frame.locals)
+        for clave, valor in list(namespace.items()):
+            if isinstance(valor, CruthonFunction):
+                # Las funciones del cuerpo de la clase son métodos: se
+                # buscan en el MRO de la clase y se ligan a la instancia.
+                namespace[clave] = CruthonMethod(valor, clase)
+        clase = self._aplicar_decoradores_clase(clase, node, blob, frame)
+        self._bind(node.name, clase, blob, frame)
+        return None
+
+    def _aplicar_decoradores_clase(self, clase: CruthonClass, node, blob, frame) -> Any:
+        """Aplica los decoradores de una clase, de abajo hacia arriba."""
+        for decorator in reversed(node.decorators or []):
+            clase = self._aplicar_decorador(decorator, clase, blob, frame)
+        return clase
+
+    def _exec_with(self, node, blob, frame):
+        """Ejecuta ``with``: uno o varios gestores de contexto."""
+        gestores: List[Any] = []
+        try:
+            for item in node.items:
+                contexto = self.eval(item.context_expr, blob, frame)
+                entrar = self._metodo_especial(contexto, "__enter__")
+                salir = self._metodo_especial(contexto, "__exit__")
+                if entrar is None or salir is None:
+                    raise CruthonRuntimeError(
+                        "el objeto no admite el protocolo de gestor de "
+                        f"contexto: {type(contexto).__name__}"
+                    )
+                valor = entrar()
+                gestores.append((contexto, salir))
+                if item.optional_vars is not None:
+                    self.assign(item.optional_vars, valor, blob, frame)
+            self.exec_block(node.body, blob, frame)
+        except (BreakSignal, ContinueSignal, ReturnSignal) as control:
+            # Un ``break``, ``continue`` o ``return`` cierra los gestores
+            # como si el cuerpo hubiera terminado bien.
+            self._cerrar_gestores(gestores, None)
+            raise control
+        except BaseException as error:  # noqa: BLE001 - se relanza si no casa
+            if not self._cerrar_gestores(gestores, error):
+                raise
+            return None
+        self._cerrar_gestores(gestores, None)
+        return None
+
+    @staticmethod
+    def _cerrar_gestores(gestores: List[Any], error: Optional[BaseException]) -> bool:
+        """Cierra los gestores de contexto; dice si el error quedó suprimido."""
+        suprimido = False
+        while gestores:
+            contexto, salir = gestores.pop()
+            if error is None:
+                salir(None, None, None)
+                continue
+            if salir(type(error), error, error.__traceback__) and not suprimido:
+                suprimido = True
+                error = None
+        return suprimido
+
+    @staticmethod
+    def _metodo_especial(obj: Any, nombre: str) -> Any:
+        """Busca un método especial, como ``__enter__`` o ``__exit__``.
+
+        En Python los métodos especiales se buscan en el tipo. Para una
+        instancia de Cruthon, el equivalente es el MRO de su clase. Para un
+        objeto de Python, se busca el método *ligado* a la instancia: pedirlo
+        en el tipo devolvería el método sin ligar, que no sabe a qué objeto
+        pertenece (``file.__enter__`` sin argumento no funciona).
+        """
+        if isinstance(obj, CruthonInstance):
+            encontrado = buscar_metodo(obj, nombre)
+            return None if encontrado is AUSENTE else encontrado
+        return getattr(obj, nombre, None)
+
+    def _exec_raise(self, node, blob, frame):
+        """Ejecuta ``raise``, ``raise Excepción`` y ``raise Excepción desde ...``."""
+        if node.exc is None:
+            # ``raise`` a secas: vuelve a lanzar la excepción que se está
+            # manejando en este momento.
+            if self.excepcion_actual is None:
+                raise CruthonRuntimeError("no hay ninguna excepción activa que relanzar")
+            raise self.excepcion_actual
+        excepcion = self.eval(node.exc, blob, frame)
+        if not isinstance(excepcion, BaseException):
+            raise CruthonRuntimeError(
+                "las excepciones deben derivar de BaseException, no de "
+                f"{type(excepcion).__name__}"
+            )
+        if node.cause is not None:
+            causa = self.eval(node.cause, blob, frame)
+            excepcion.__cause__ = causa
+        self.excepcion_actual = excepcion
+        raise excepcion
 
     def _exec_return(self, node, blob, frame):
         value = None if node.value is None else self.eval(node.value, blob, frame)
@@ -362,7 +608,25 @@ class Interpreter:
         return None
 
     def _exec_nonlocal(self, node, blob, frame):
-        raise CruthonRuntimeError("'nonlocal' no está soportado en Cruthon")
+        if frame is None:
+            return None
+        for name in node.names:
+            if not self._nonlocal_existe(name, frame):
+                raise NameNotFound(
+                    f"no hay binding para 'nonlocal {name}' en ningún ámbito externo"
+                )
+            frame.nonlocals.add(name)
+        return None
+
+    @staticmethod
+    def _nonlocal_existe(name: str, frame: Frame) -> bool:
+        """¿El nombre vive en un marco de función externo?"""
+        current = frame.parent
+        while current is not None:
+            if name in current.locals:
+                return True
+            current = current.parent
+        return False
 
     def _exec_assert(self, node, blob, frame):
         if not self.eval(node.test, blob, frame):
@@ -372,6 +636,23 @@ class Interpreter:
             raise AssertionError(message)
         return None
 
+    @staticmethod
+    def _excepcion_casa(error: BaseException, esperado: Any) -> bool:
+        """¿La excepción casa con el tipo (o tupla de tipos) del ``except``?
+
+        Igual que en Python, ``except (TypeError, ValueError)`` acepta
+        cualquiera de los dos; una tupla de tipos no es un ``type``, así que
+        no se puede pasar tal cual a ``isinstance``.
+        """
+        if isinstance(esperado, tuple):
+            return any(
+                isinstance(candidato, type) and isinstance(error, candidato)
+                for candidato in esperado
+            )
+        if isinstance(esperado, type):
+            return isinstance(error, esperado)
+        return False
+
     def _exec_try(self, node, blob, frame):
         try:
             try:
@@ -380,21 +661,24 @@ class Interpreter:
                 raise
             except Exception as error:  # noqa: BLE001 - se re-lanza si no casa
                 handled = False
-                for handler in node.handlers:
-                    if handler.type is None:
-                        matched = True
-                    else:
-                        expected = self.eval(handler.type, blob, frame)
-                        matched = isinstance(error, expected) if isinstance(
-                            expected, type
-                        ) else False
-                    if not matched:
-                        continue
-                    handled = True
-                    if handler.name:
-                        self._bind(handler.name, error, blob, frame)
-                    self.exec_block(handler.body, blob, frame)
-                    break
+                anterior = self.excepcion_actual
+                self.excepcion_actual = error
+                try:
+                    for handler in node.handlers:
+                        if handler.type is None:
+                            matched = True
+                        else:
+                            expected = self.eval(handler.type, blob, frame)
+                            matched = self._excepcion_casa(error, expected)
+                        if not matched:
+                            continue
+                        handled = True
+                        if handler.name:
+                            self._bind(handler.name, error, blob, frame)
+                        self.exec_block(handler.body, blob, frame)
+                        break
+                finally:
+                    self.excepcion_actual = anterior
                 if not handled:
                     raise
         finally:
@@ -408,6 +692,7 @@ class Interpreter:
         N.AugAssign: _exec_aug_assign,
         N.BlobDecl: _exec_blob_decl,
         N.FuncDef: _exec_func_def,
+        N.ClassDef: _exec_class_def,
         N.Return: _exec_return,
         N.Pass: _exec_pass,
         N.Break: _exec_break,
@@ -422,6 +707,8 @@ class Interpreter:
         N.Nonlocal: _exec_nonlocal,
         N.Assert: _exec_assert,
         N.Try: _exec_try,
+        N.Raise: _exec_raise,
+        N.With: _exec_with,
     }
 
     # -- asignación -----------------------------------------------------
@@ -446,15 +733,41 @@ class Interpreter:
             obj[index] = value
             return
         if isinstance(target, (N.Tuple, N.List)):
-            values = list(value)
-            if len(values) != len(target.elts):
-                raise CruthonRuntimeError(
-                    f"se esperaban {len(target.elts)} valores y llegaron {len(values)}"
-                )
-            for element, item in zip(target.elts, values):
-                self.assign(element, item, blob, frame)
+            self._assign_sequence(target.elts, value, blob, frame)
             return
         raise CruthonRuntimeError("destino de asignación inválido")
+
+    def _assign_sequence(self, elements, value, blob, frame) -> None:
+        """Desempaqueta una secuencia sobre los destinos de una tupla/lista.
+
+        Como en Python, un único destino con ``*resto`` captura el resto de
+        los valores: ``a, *b = [1, 2, 3]`` deja ``b`` con ``[2, 3]``.
+        """
+        values = list(value)
+        starred = [i for i, element in enumerate(elements) if isinstance(element, N.Starred)]
+        if len(starred) > 1:
+            raise CruthonRuntimeError("no puede haber más de un destino con '*'")
+        if not starred:
+            if len(values) != len(elements):
+                raise CruthonRuntimeError(
+                    f"se esperaban {len(elements)} valores y llegaron {len(values)}"
+                )
+            for element, item in zip(elements, values):
+                self.assign(element, item, blob, frame)
+            return
+        index = starred[0]
+        antes = index
+        despues = len(elements) - index - 1
+        if len(values) < antes + despues:
+            raise CruthonRuntimeError(
+                f"se esperaban al menos {antes + despues} valores y llegaron {len(values)}"
+            )
+        for element, item in zip(elements[:index], values[:index]):
+            self.assign(element, item, blob, frame)
+        resto = values[index : len(values) - despues]
+        self.assign(elements[index].value, resto, blob, frame)
+        for element, item in zip(elements[index + 1 :], values[len(values) - despues :]):
+            self.assign(element, item, blob, frame)
 
     def assign_name(self, name: str, value: Any, blob: Blob, frame: Optional[Frame]) -> None:
         """Asigna un nombre simple respetando las reglas de ámbito por conjuntos."""
@@ -462,7 +775,20 @@ class Interpreter:
             if name in frame.globals:
                 self.assign_name_in(self.globals, name, value)
                 return
-            current: Optional[Frame] = frame
+            if name in frame.nonlocals:
+                # ``nonlocal``: la escritura va al marco externo que lo declara.
+                current: Optional[Frame] = frame.parent
+                while current is not None:
+                    if name in current.locals:
+                        current.locals[name] = value
+                        return
+                    current = current.parent
+            if frame.is_class_body:
+                # El cuerpo de una clase enlaza sus nombres en el espacio de
+                # nombres de la clase, como en Python.
+                frame.locals[name] = value
+                return
+            current = frame
             while current is not None:
                 if name in current.locals:
                     current.locals[name] = value
@@ -534,6 +860,10 @@ class Interpreter:
             ref = self.globals.lookup(name)
             if ref is not None:
                 return ref.get()
+        if name == "super" and frame is not None and frame.owner_class is not None:
+            # ``super()`` sólo existe dentro de un método: necesita saber la
+            # clase y la instancia del método en curso.
+            return SuperFabrica(frame.owner_class, frame.owner_instance)
         ref = blob.lookup(name)
         if ref is not None:
             return ref.get()
@@ -561,26 +891,105 @@ class Interpreter:
 
     def _eval_call(self, node, blob, frame):
         func = self.eval(node.func, blob, frame)
-        args = [self.eval(argument, blob, frame) for argument in node.args]
+        args: List[Any] = []
+        for argument in node.args:
+            if isinstance(argument, N.Starred):
+                # ``f(*seq)``: la secuencia se expande en argumentos
+                # posicionales, como en Python.
+                args.extend(self.eval(argument.value, blob, frame))
+                continue
+            args.append(self.eval(argument, blob, frame))
         kwargs = {}
         for keyword in node.keywords:
+            value = self.eval(keyword.value, blob, frame)
             if keyword.arg is None:
-                raise CruthonRuntimeError("los argumentos **kwargs no están soportados")
-            kwargs[keyword.arg] = self.eval(keyword.value, blob, frame)
+                # ``f(**d)``: el diccionario se expande en argumentos por
+                # palabra clave.
+                if not isinstance(value, dict):
+                    raise CruthonRuntimeError(
+                        "los argumentos **kwargs deben ser un diccionario"
+                    )
+                kwargs.update(value)
+                continue
+            kwargs[keyword.arg] = value
         return self.call(func, args, kwargs)
 
     def call(self, func: Any, args: List[Any], kwargs: Dict[str, Any]) -> Any:
         if isinstance(func, CruthonFunction):
             return self.call_function(func, args, kwargs)
+        if isinstance(func, CruthonClass):
+            return self.instantiate(func, args, kwargs)
         if isinstance(func, Blob):
             raise ScopeError("un blob no es invocable")
         return func(*args, **kwargs)
+
+    def instantiate(
+        self, clase: CruthonClass, args: List[Any], kwargs: Dict[str, Any]
+    ) -> CruthonInstance:
+        """Crea una instancia de ``clase`` y llama a su ``__init__``."""
+        inicializador = clase.lookup("__init__")
+        base = None
+        if clase.bases_py:
+            # La clase hereda de un tipo de Python: la instancia se apoya en
+            # un objeto de ese tipo. Si la propia clase define ``__init__``,
+            # los argumentos son para él y el objeto nativo nace vacío; si no,
+            # los argumentos inicializan el tipo nativo, como en Python.
+            tipo_base = clase.bases_py[0]
+            if inicializador is AUSENTE:
+                base = tipo_base(*args, **kwargs)
+            else:
+                base = tipo_base()
+        instancia = CruthonInstance(clase, base)
+        if inicializador is AUSENTE:
+            return instancia
+        if isinstance(inicializador, CruthonMethod):
+            inicializador.ligar(instancia)(*args, **kwargs)
+        else:
+            inicializador(*args, **kwargs)
+        return instancia
+
+    def call_method(
+        self,
+        function: CruthonFunction,
+        instancia: CruthonInstance,
+        args: List[Any],
+        kwargs: Dict[str, Any],
+    ) -> Any:
+        """Llama a un método con la instancia ya enlazada como ``self``."""
+        return self._ejecutar_funcion(
+            function,
+            [instancia] + list(args),
+            kwargs,
+            owner_class=function.owner_class,
+            owner_instance=instancia,
+        )
 
     def call_function(
         self, function: CruthonFunction, args: List[Any], kwargs: Dict[str, Any]
     ) -> Any:
         """Llama a una función con el ámbito del blob donde fue definida."""
-        frame = Frame(blob=function.blob)
+        if function.is_generator:
+            # Una función generadora no se ejecuta al llamarla: devuelve el
+            # generador, que va avanzando bajo demanda.
+            return CruthonGenerator(self, function, args, kwargs)
+        return self._ejecutar_funcion(function, args, kwargs)
+
+    def _ejecutar_funcion(
+        self,
+        function: CruthonFunction,
+        args: List[Any],
+        kwargs: Dict[str, Any],
+        owner_class: Optional[CruthonClass] = None,
+        owner_instance: Optional[CruthonInstance] = None,
+        generator: Optional[CruthonGenerator] = None,
+    ) -> Any:
+        """Ejecuta el cuerpo de una función y devuelve lo que devuelve."""
+        # El marco nuevo cuelga del marco donde se definió la función: así una
+        # función anidada ve las variables locales de su entorno.
+        frame = Frame(blob=function.blob, parent=function.closure)
+        frame.owner_class = owner_class
+        frame.owner_instance = owner_instance
+        frame.generator = generator
         spec = function.args
         names = [arg.name for arg in spec.args]
         if len(args) > len(names) and spec.vararg is None:
@@ -602,16 +1011,25 @@ class Interpreter:
                 frame.locals[name] = self.eval(spec.defaults[default_index], function.blob, None)
         if spec.vararg:
             frame.locals[spec.vararg] = tuple(args[len(names) :])
-        for name in spec.kwonlyargs:
-            if name in kwargs:
-                frame.locals[name.name] = kwargs.pop(name)
-        if spec.kwarg:
-            frame.locals[spec.kwarg] = kwargs
-        for name, value in kwargs.items():
-            if name not in frame.locals:
+        for arg in spec.kwonlyargs:
+            if arg.name in kwargs:
+                frame.locals[arg.name] = kwargs.pop(arg.name)
+            elif arg.default is not None:
+                frame.locals[arg.name] = self.eval(arg.default, function.blob, None)
+            else:
                 raise CruthonRuntimeError(
-                    f"argumento inesperado '{name}' para {function.name!r}"
+                    f"falta el argumento '{arg.name}' de {function.name!r}"
                 )
+        if spec.kwarg:
+            # ``**kwargs``: los argumentos sobrantes se recogen en un
+            # diccionario, como en Python.
+            frame.locals[spec.kwarg] = dict(kwargs)
+        else:
+            for name in kwargs:
+                if name not in frame.locals:
+                    raise CruthonRuntimeError(
+                        f"argumento inesperado '{name}' para {function.name!r}"
+                    )
         try:
             self.exec_block(function.body, function.blob, frame)
         except ReturnSignal as signal:
@@ -621,9 +1039,27 @@ class Interpreter:
     def _eval_binop(self, node, blob, frame):
         left = self.eval(node.left, blob, frame)
         right = self.eval(node.right, blob, frame)
-        if node.op in SET_OPERATIONS and isinstance(left, Blob) and isinstance(right, Blob):
-            return SET_FUNCTIONS[node.op](left, right)
+        if node.op in SET_OPERATIONS:
+            resultado = self._operacion_conjuntos(node.op, left, right)
+            if resultado is not None:
+                return resultado
         return _BIN_OPS[node.op](left, right)
+
+    def _eval_blob_source(self, source, name, blob, frame):
+        """Evalúa el operando de una declaración ``blob nombre = ...``.
+
+        La operación de conjuntos se resuelve aquí, y no en el evaluador
+        genérico de operadores, porque necesita el nombre final del blob
+        (``blob c = a & b:``) para registrarlo en sus dos operandos.
+        """
+        if isinstance(source, N.BinOp) and source.op in SET_OPERATIONS:
+            left = self.eval(source.left, blob, frame)
+            right = self.eval(source.right, blob, frame)
+            resultado = self._operacion_conjuntos(source.op, left, right, name)
+            if resultado is not None:
+                return resultado
+            return _BIN_OPS[source.op](left, right)
+        return self.eval(source, blob, frame)
 
     def _eval_unaryop(self, node, blob, frame):
         value = self.eval(node.operand, blob, frame)
@@ -676,17 +1112,44 @@ class Interpreter:
         return self.eval(node.orelse, blob, frame)
 
     def _eval_tuple(self, node, blob, frame):
-        return tuple(self.eval(element, blob, frame) for element in node.elts)
+        elementos: List[Any] = []
+        for element in node.elts:
+            if isinstance(element, N.Starred):
+                elementos.extend(self.eval(element.value, blob, frame))
+            else:
+                elementos.append(self.eval(element, blob, frame))
+        return tuple(elementos)
 
     def _eval_list(self, node, blob, frame):
-        return [self.eval(element, blob, frame) for element in node.elts]
+        elementos: List[Any] = []
+        for element in node.elts:
+            if isinstance(element, N.Starred):
+                elementos.extend(self.eval(element.value, blob, frame))
+            else:
+                elementos.append(self.eval(element, blob, frame))
+        return elementos
 
     def _eval_set(self, node, blob, frame):
-        return {self.eval(element, blob, frame) for element in node.elts}
+        elementos: set = set()
+        for element in node.elts:
+            if isinstance(element, N.Starred):
+                elementos.update(self.eval(element.value, blob, frame))
+            else:
+                elementos.add(self.eval(element, blob, frame))
+        return elementos
 
     def _eval_dict(self, node, blob, frame):
         result = {}
         for key_node, value_node in zip(node.keys, node.values):
+            if isinstance(key_node, N.Starred):
+                # ``{**otro}``: se actualiza con el diccionario expandido.
+                extra = self.eval(key_node.value, blob, frame)
+                if not isinstance(extra, dict):
+                    raise CruthonRuntimeError(
+                        "la expansión de un diccionario debe ser un diccionario"
+                    )
+                result.update(extra)
+                continue
             result[self.eval(key_node, blob, frame)] = self.eval(value_node, blob, frame)
         return result
 
@@ -738,7 +1201,28 @@ class Interpreter:
             kwarg=spec.kwarg, defaults=spec.defaults,
         )
         body = [N.Return(value=node.body)]
-        return CruthonFunction("<lambda>", arguments, body, blob)
+        return CruthonFunction("<lambda>", arguments, body, blob, None, self)
+
+    def _eval_namedexpr(self, node, blob, frame):
+        """Evalúa ``(x := valor)``: asigna y devuelve el valor."""
+        value = self.eval(node.value, blob, frame)
+        self.assign_name(node.target.id, value, blob, frame)
+        return value
+
+    def _eval_yield(self, node, blob, frame):
+        """Evalúa ``yield valor`` y ``yield from iterable``."""
+        generador = frame.generator if frame is not None else None
+        if generador is None:
+            raise CruthonRuntimeError(
+                "'yield' fuera de una función generadora"
+            )
+        if node.delegate:
+            for item in self.eval(node.value, blob, frame):
+                generador.emitir(item)
+            return None
+        value = None if node.value is None else self.eval(node.value, blob, frame)
+        generador.emitir(value)
+        return None
 
     def _eval_joinedstr(self, node, blob, frame):
         pieces = []
@@ -782,14 +1266,19 @@ class Interpreter:
         N.Lambda: _eval_lambda,
         N.JoinedStr: _eval_joinedstr,
         N.FormattedValue: _eval_formattedvalue,
+        N.NamedExpr: _eval_namedexpr,
+        N.Yield: _eval_yield,
     }
 
     # -- operaciones de blobs --------------------------------------------
-    def eval_blob_source(self, source: Any, name: str, blob: Blob, frame: Optional[Frame]) -> Any:
-        """Evalúa el operando de una declaración ``blob nombre = ...``."""
-        if isinstance(source, N.BinOp) and source.op in SET_OPERATIONS:
-            left = self.eval(source.left, blob, frame)
-            right = self.eval(source.right, blob, frame)
-            if isinstance(left, Blob) and isinstance(right, Blob):
-                return SET_FUNCTIONS[source.op](left, right, name)
-        return self.eval(source, blob, frame)
+    def _operacion_conjuntos(
+        self, op: str, left: Any, right: Any, name: Optional[str] = None
+    ) -> Optional[Blob]:
+        """Aplica una operación de conjuntos si ambos operandos son blobs.
+
+        Devuelve ``None`` si los operandos no son blobs: en ese caso la
+        operación es la de Python (bit a bit, por ejemplo) y no de conjuntos.
+        """
+        if not isinstance(left, Blob) or not isinstance(right, Blob):
+            return None
+        return SET_FUNCTIONS[op](left, right, name)

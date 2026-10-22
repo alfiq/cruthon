@@ -13,6 +13,7 @@ lenguaje:
 
 from __future__ import annotations
 
+import unicodedata
 from enum import Enum, auto
 from typing import List, Tuple
 
@@ -57,8 +58,22 @@ OPERATORS: Tuple[str, ...] = (
 
 #: Prefijos de cadena admitidos (como en CPython).
 STRING_PREFIXES = frozenset(
-    {"", "r", "b", "u", "f", "rb", "br", "rf", "fr", "br", "rb"}
+    {"", "r", "b", "u", "f", "rb", "br", "rf", "fr"}
 )
+
+#: Secuencias de escape simples, con el mismo valor que les da CPython.
+SIMPLE_ESCAPES = {
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+}
 
 _IDENT_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 _IDENT_CONT = _IDENT_START | set("0123456789")
@@ -78,6 +93,86 @@ class Token:
 
     def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
         return f"Token({self.type.name}, {self.value!r}, line={self.lineno})"
+
+
+def decode_escapes(
+    raw: str,
+    filename: str = "<cruthon>",
+    lineno: int = 0,
+) -> str:
+    """Interpreta las secuencias de escape de una cadena, como hace CPython.
+
+    Acepta las escapes simples (``\\n``, ``\\t``...), la continuación de línea
+    (``\\`` seguido de un salto de línea), los escapes octales, hexadecimales
+    y Unicode (``\\xhh``, ``\\uXXXX``, ``\\UXXXXXXXX``, ``\\N{nombre}``). Un
+    escape desconocido se conserva con su barra invertida, igual que en
+    Python.
+    """
+    if "\\" not in raw:
+        return raw
+    partes: List[str] = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch != "\\":
+            partes.append(ch)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            partes.append("\\")
+            break
+        escape = raw[i]
+        i += 1
+        if escape == "\n":
+            # Continuación de línea: el salto de línea desaparece.
+            continue
+        if escape in SIMPLE_ESCAPES:
+            partes.append(SIMPLE_ESCAPES[escape])
+            continue
+        if escape == "0" or escape in "1234567":
+            digitos = escape
+            while i < n and len(digitos) < 3 and raw[i] in "01234567":
+                digitos += raw[i]
+                i += 1
+            partes.append(chr(int(digitos, 8)))
+            continue
+        if escape in "xXuU":
+            largos = {"x": 2, "u": 4, "U": 8}[escape]
+            digitos = raw[i : i + largos]
+            if len(digitos) != largos or any(
+                d not in "0123456789abcdefABCDEF" for d in digitos
+            ):
+                raise CruthonSyntaxError(
+                    f"escape \\{escape} inválido: se esperaban {largos} dígitos hexadecimales",
+                    filename,
+                    lineno,
+                )
+            i += largos
+            partes.append(chr(int(digitos, 16)))
+            continue
+        if escape == "N" and i < n and raw[i] == "{":
+            fin = raw.find("}", i)
+            if fin == -1:
+                raise CruthonSyntaxError(
+                    "escape \\N{...} sin cerrar", filename, lineno
+                )
+            nombre = raw[i + 1 : fin]
+            i = fin + 1
+            try:
+                partes.append(unicodedata.lookup(nombre))
+            except KeyError:
+                raise CruthonSyntaxError(
+                    f"nombre de carácter Unicode desconocido: {nombre!r}",
+                    filename,
+                    lineno,
+                ) from None
+            continue
+        # Escape desconocido: Python conserva la barra invertida.
+        partes.append("\\")
+        partes.append(escape)
+    return "".join(partes)
 
 
 def split_fstring(raw: str) -> List[Tuple[str, object]]:
@@ -101,7 +196,7 @@ def split_fstring(raw: str) -> List[Tuple[str, object]]:
             j = _find_closing_brace(raw, i)
             expr_src, conversion, spec = _split_expression(raw[i + 1 : j])
             if buffer:
-                parts.append(("str", "".join(buffer)))
+                parts.append(("str", decode_escapes("".join(buffer))))
                 buffer = []
             parts.append(("expr", (expr_src, conversion, spec)))
             i = j + 1
@@ -115,7 +210,7 @@ def split_fstring(raw: str) -> List[Tuple[str, object]]:
         buffer.append(ch)
         i += 1
     if buffer:
-        parts.append(("str", "".join(buffer)))
+        parts.append(("str", decode_escapes("".join(buffer))))
     return parts
 
 
@@ -183,6 +278,7 @@ class Lexer:
         self.tokens: List[Token] = []
         self._indents = [0]
         self._paren = 0
+        self._open: List[str] = []
         self._lineno = 1
 
     # -- API pública ---------------------------------------------------
@@ -233,13 +329,25 @@ class Lexer:
                     i += len(op)
                     if op in "([{":
                         self._paren += 1
+                        self._open.append(op)
                     elif op in ")]}":
                         self._paren = max(0, self._paren - 1)
+                        if self._open:
+                            self._open.pop()
                     break
             else:
                 raise CruthonSyntaxError(
                     f"carácter inesperado {ch!r}", self.filename, self._lineno, i
                 )
+        if self._paren > 0:
+            # Quedan corchetes abiertos: la entrada está incompleta y la REPL
+            # debe pedir otra línea (como hace ``codeop`` en CPython).
+            abierto = self._open[-1] if self._open else "("
+            raise IncompleteInput(
+                f"entrada incompleta (falta cerrar {abierto!r})",
+                self.filename,
+                self._lineno,
+            )
         # Fin del fichero: cerramos bloques y línea.
         if self.tokens and self.tokens[-1].type not in (TokenType.NEWLINE,):
             self._emit(TokenType.NEWLINE, "")
@@ -313,8 +421,10 @@ class Lexer:
         n = len(src)
         j = i + len(prefix)
         quote = src[j]
-        raw = "b" in prefix.lower()
-        is_fstring = "f" in prefix.lower()
+        minusculas = prefix.lower()
+        is_raw = "r" in minusculas
+        is_bytes = "b" in minusculas
+        is_fstring = "f" in minusculas
         triple = src.startswith(quote * 3, j)
         if triple:
             j += 3
@@ -339,15 +449,9 @@ class Lexer:
                 if j + 1 >= n:
                     raise IncompleteInput("cadena sin cerrar", self.filename, self._lineno)
                 nxt = src[j + 1]
-                if raw:
-                    chunks.append(ch)
-                    if nxt != "\n":
-                        chunks.append(nxt)
-                    j += 2
-                else:
-                    chunks.append(ch)
-                    chunks.append(nxt)
-                    j += 2
+                chunks.append(ch)
+                chunks.append(nxt)
+                j += 2
                 if nxt == "\n":
                     self._lineno += 1
                 continue
@@ -357,9 +461,23 @@ class Lexer:
             j += 1
         body = "".join(chunks)
         if is_fstring:
+            # El cuerpo de una f-string se decodifica al construir el nodo,
+            # para no tocar el código de las expresiones que van dentro.
             self._emit(TokenType.FSTRING, body)
-        else:
+        elif is_raw:
             self._emit(TokenType.STRING, body)
+        elif is_bytes:
+            try:
+                valor = decode_escapes(body, self.filename, self._lineno).encode("latin-1")
+            except UnicodeEncodeError:
+                raise CruthonSyntaxError(
+                    "un literal de bytes sólo puede contener caracteres ASCII",
+                    self.filename,
+                    self._lineno,
+                ) from None
+            self._emit(TokenType.STRING, valor)
+        else:
+            self._emit(TokenType.STRING, decode_escapes(body, self.filename, self._lineno))
         return j
 
     def _lex_number(self, i: int) -> int:

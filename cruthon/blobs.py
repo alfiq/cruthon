@@ -14,16 +14,46 @@ La visibilidad es geométrica: un nombre es visible desde un blob si el área
 donde vive está contenida en el área del blob activo. Un blob contenedor ve
 todo lo que hay dentro de su área (incluidas las intersecciones que contiene);
 dos blobs hermanos no se ven entre sí aunque uno contenga al otro.
+
+La memoria se modela con *celdas*: cada nombre vive en una celda y una celda
+puede ser compartida por varios blobs. Eso es exactamente lo que pide el
+documento para la intersección: "un blob nuevo con memoria propia, compartida
+por los blobs que lo originaron (lectura y escritura por ambos)". Cuando dos
+blobs declaran el mismo nombre y se intersectan, ambos operandos y la
+intersección pasan a compartir la misma celda: escribir por cualquiera de los
+tres se ve en los otros dos.
+
+La *tabla de pertenencia* (nombre -> blobs donde vive el nombre) y la
+resolución de nombres (``Blob.lookup``) comparten el mismo recorrido
+(``Blob.areas``): la tabla no es decorativa, es la lectura del modelo.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, Iterator, List, Optional
 
-from .errors import BlobTypeError
+from .errors import BlobTypeError, NameNotFound
 
 #: Operaciones de conjuntos soportadas entre blobs.
 SET_OPERATIONS = ("&", "|", "-", "^")
+
+
+class Cell:
+    """Celda de memoria: el valor que vive bajo un nombre.
+
+    ``shared`` marca las celdas que son memoria común de una intersección.
+    Una celda compartida la escriben todos los blobs que la poseen.
+    """
+
+    __slots__ = ("value", "shared")
+
+    def __init__(self, value: Any = None, shared: bool = False) -> None:
+        self.value = value
+        self.shared = shared
+
+    def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
+        estado = " compartida" if self.shared else ""
+        return f"<Cell {self.value!r}{estado}>"
 
 
 class Ref:
@@ -53,23 +83,51 @@ class Ref:
             inner = self.source.lookup_own(self.name)
             return None if inner is None else inner.get()
         blob = self.blob
-        if self.name in blob.storage:
-            return blob.storage[self.name]
-        return blob.refs.get(self.name)
+        cell = blob.storage.get(self.name)
+        if cell is not None:
+            return cell.value
+        if self.name in blob.refs:
+            # El nombre es una referencia a otro blob (un sub-blob o una
+            # intersección), no un valor.
+            return blob.refs[self.name]
+        return None
 
     def set(self, value: Any) -> None:
         if self.source is not None:
             raise BlobTypeError(
                 f"'{self.name}' es una vista de solo lectura (operación de conjuntos)"
             )
-        self.blob.storage[self.name] = value
+        cell = self.blob.storage.get(self.name)
+        if cell is None:
+            raise NameNotFound(f"nombre no definido: {self.name!r}")
+        # Si la celda es compartida, el cambio lo ven todos los blobs que la
+        # poseen: ése es el sentido de "memoria compartida" del documento.
+        cell.value = value
 
     def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
         return f"<Ref {self.blob.name}.{self.name}>"
 
 
-class InheritedView:
-    """Vista de solo lectura sobre el ámbito de otro blob.
+class Area:
+    """Zona de nombres de la que se resuelve un nombre.
+
+    La implementan los propios blobs (sus miembros) y las vistas heredadas
+    (los operandos de una unión o una diferencia, en modo sólo lectura).
+    """
+
+    def resolve(self, name: str) -> Optional[Ref]:
+        raise NotImplementedError
+
+    def declared_names(self) -> FrozenSet[str]:
+        raise NotImplementedError
+
+    @property
+    def owner(self) -> str:
+        raise NotImplementedError
+
+
+class InheritedView(Area):
+    """Vista de sólo lectura sobre el ámbito de otro blob.
 
     Es lo que usa la unión (``|``), la diferencia (``-``) y la diferencia
     simétrica (``^``): el blob resultante puede leer lo que corresponde a sus
@@ -83,7 +141,7 @@ class InheritedView:
         self.source = source
         self.exclude = exclude or frozenset()
 
-    def lookup(self, name: str) -> Optional[Ref]:
+    def resolve(self, name: str) -> Optional[Ref]:
         """Resuelve ``name`` entre las declaraciones propias del blob de origen.
 
         Sólo se miran los miembros declarados en el propio blob (no sus
@@ -98,53 +156,63 @@ class InheritedView:
             return None
         return Ref(ref.blob, name, readonly=True, source=ref.blob)
 
+    def declared_names(self) -> FrozenSet[str]:
+        return self.source.declared_names() - self.exclude
 
-class Blob:
+    @property
+    def owner(self) -> str:
+        return self.source.name
+
+
+class Blob(Area):
     """Un blob: conjunto con memoria propia y tabla de pertenencia.
 
-    * ``storage`` — los miembros que viven en el blob (variables y funciones).
+    * ``storage`` — las celdas de los miembros que viven en el blob
+      (variables y funciones).
     * ``refs`` — referencias a otros blobs (los blobs anidados y las
       intersecciones en las que el blob participa).
     * ``children`` — blobs cuyo ámbito entra en el ámbito de este.
-    * ``inherited`` — vistas de solo lectura de los operandos de una
+    * ``inherited`` — vistas de sólo lectura de los operandos de una
       operación de conjuntos.
     """
 
     __slots__ = (
         "name",
-        "parent",
         "storage",
         "refs",
         "children",
         "inherited",
         "op",
         "operands",
-        "decl_order",
     )
 
     def __init__(
         self,
         name: str = "<blob>",
-        parent: Optional["Blob"] = None,
         op: Optional[str] = None,
         operands: Optional[List["Blob"]] = None,
     ) -> None:
         self.name = name
-        self.parent = parent
-        self.storage: Dict[str, Any] = {}
+        self.storage: Dict[str, Cell] = {}
         self.refs: Dict[str, "Blob"] = {}
         self.children: List["Blob"] = []
         self.inherited: List[InheritedView] = []
         self.op = op
         self.operands: List["Blob"] = list(operands or [])
-        self.decl_order: List[str] = []
 
     # -- construcción ---------------------------------------------------
     def define(self, name: str, value: Any) -> None:
-        """Declara un miembro (variable o función) en el blob."""
-        if name not in self.storage:
-            self.decl_order.append(name)
-        self.storage[name] = value
+        """Declara un miembro (variable o función) en el blob.
+
+        Si el nombre ya vive en una celda compartida (una intersección), la
+        escritura se propaga a los blobs que la comparten: dentro de la zona
+        común, todos leen y escriben lo mismo.
+        """
+        cell = self.storage.get(name)
+        if cell is not None and cell.shared:
+            cell.value = value
+            return
+        self.storage[name] = Cell(value)
 
     def add_child(self, child: "Blob") -> None:
         """Añade un blob cuyo ámbito queda dentro del de este."""
@@ -156,57 +224,67 @@ class Blob:
         self.refs[name] = blob
 
     def inherit(self, source: "Blob", exclude: Optional[FrozenSet[str]] = None) -> None:
-        """Añade una vista de solo lectura sobre otro blob."""
+        """Añade una vista de sólo lectura sobre otro blob."""
         self.inherited.append(InheritedView(source, exclude))
 
     # -- consultas ------------------------------------------------------
-    def member_names(self) -> List[str]:
-        """Nombres de los miembros propios (variables y funciones)."""
-        return [name for name in self.decl_order if name in self.storage]
-
     def declared_names(self) -> FrozenSet[str]:
         """Todos los nombres que el blob declara, incluidos los blobs anidados."""
         return frozenset(self.storage) | frozenset(self.refs)
 
-    def visible_names(self) -> List[str]:
-        """Nombres alcanzables desde este blob (área de pertenencia)."""
-        seen: List[str] = []
-        for name in self.membership_table():
-            if name not in seen:
-                seen.append(name)
-        return seen
+    @property
+    def owner(self) -> str:
+        return self.name
 
     def membership_table(self) -> Dict[str, List[str]]:
         """Tabla de pertenencia: nombre -> blobs donde vive.
 
         Es el sustituto cruthoniano del MRO de CPython: en vez de una cadena
-        lineal de herencia, cada nombre dice en qué blobs vive.
+        lineal de herencia, cada nombre dice en qué blobs vive. Se construye
+        con el mismo recorrido que usa la resolución (``Blob.areas``).
         """
-        table: Dict[str, List[str]] = {}
-        visited: set = set()
-
-        def walk(blob: "Blob") -> None:
-            if id(blob) in visited:
-                return
-            visited.add(id(blob))
-            for name in blob.storage:
-                table.setdefault(name, []).append(blob.name)
-            for name in blob.refs:
-                table.setdefault(name, []).append(blob.name)
-            for child in blob.children:
-                walk(child)
-
-        walk(self)
-        return table
+        tabla: Dict[str, List[str]] = {}
+        vistos: set = set()
+        for area in self.areas():
+            if id(area) in vistos:
+                continue
+            vistos.add(id(area))
+            for name in area.declared_names():
+                nombres = tabla.setdefault(name, [])
+                if area.owner not in nombres:
+                    nombres.append(area.owner)
+        return tabla
 
     # -- resolución de nombres -------------------------------------------
-    def lookup_own(self, name: str) -> Optional[Ref]:
-        """Busca ``name`` entre las declaraciones propias del blob."""
+    def areas(self, _seen: Optional[set] = None) -> Iterator[Area]:
+        """Áreas del blob en orden de resolución.
+
+        Primero lo que el blob declara, después las áreas de sus sub-blobs
+        (sus intersecciones y sus subconjuntos) y por último las vistas
+        heredadas de las operaciones de conjuntos.
+        """
+        if _seen is None:
+            _seen = set()
+        if id(self) in _seen:
+            return
+        _seen.add(id(self))
+        yield self
+        for child in self.children:
+            yield from child.areas(_seen)
+        for view in self.inherited:
+            yield view
+
+    def resolve(self, name: str) -> Optional[Ref]:
+        """Resuelve ``name`` entre las declaraciones propias del blob."""
         if name in self.storage:
             return Ref(self, name)
         if name in self.refs:
             return Ref(self, name)
         return None
+
+    def lookup_own(self, name: str) -> Optional[Ref]:
+        """Busca ``name`` entre las declaraciones propias del blob."""
+        return self.resolve(name)
 
     def lookup(self, name: str, _seen: Optional[set] = None) -> Optional[Ref]:
         """Busca ``name`` en el área de este blob.
@@ -214,27 +292,11 @@ class Blob:
         Devuelve ``None`` si el nombre no vive dentro del área: eso es un
         error de alcance, no un ``NameError`` de Python.
         """
-        if _seen is None:
-            _seen = set()
-        if id(self) in _seen:
-            return None
-        _seen.add(id(self))
-        ref = self.lookup_own(name)
-        if ref is not None:
-            return ref
-        for child in self.children:
-            ref = child.lookup(name, _seen)
-            if ref is not None:
-                return ref
-        for view in self.inherited:
-            ref = view.lookup(name)
+        for area in self.areas(_seen):
+            ref = area.resolve(name)
             if ref is not None:
                 return ref
         return None
-
-    def contains(self, name: str) -> bool:
-        """¿El nombre vive dentro del área de este blob?"""
-        return self.lookup(name) is not None
 
     def __repr__(self) -> str:
         if self.op:
@@ -252,17 +314,50 @@ def _require_blobs(a: Any, b: Any, op: str) -> tuple:
     return a, b
 
 
+def _celda_compartida(a: Blob, b: Blob, nombre: str) -> Cell:
+    """Devuelve la celda que ``a`` y ``b`` van a compartir para ``nombre``.
+
+    Si alguno de los operandos ya tiene una celda compartida (por otra
+    intersección) se reutiliza: así ``A & B`` y ``B & C`` comparten la misma
+    memoria a través de ``B``, que actúa de intermediario. Si no, se crea una
+    celda nueva con el valor del primer operando.
+    """
+    celda_a = a.storage.get(nombre)
+    celda_b = b.storage.get(nombre)
+    for celda in (celda_a, celda_b):
+        if celda is not None and celda.shared:
+            return celda
+    if celda_a is not None:
+        valor = celda_a.value
+    elif celda_b is not None:
+        valor = celda_b.value
+    else:  # pragma: no cover - defensivo
+        valor = None
+    return Cell(valor, shared=True)
+
+
 def intersect(a: Blob, b: Blob, name: Optional[str] = None) -> Blob:
     """Intersección: memoria nueva compartida por ambos blobs.
 
     El blob resultante contiene solo lo que ambos comparten y crea su propia
-    zona de memoria, que ``a`` y ``b`` pueden leer y escribir por igual.
+    zona de memoria, que ``a`` y ``b`` pueden leer y escribir por igual: los
+    nombres que ambos declaran pasan a vivir en una celda común.
     """
     _require_blobs(a, b, "&")
     result = Blob(name=name or "<interseccion>", op="&", operands=[a, b])
-    common = a.declared_names() & b.declared_names()
-    if common:
-        result.inherit(a, exclude=frozenset(a.declared_names() - common))
+    comunes = a.declared_names() & b.declared_names()
+    for nombre in sorted(comunes):
+        celda_a = a.storage.get(nombre)
+        celda_b = b.storage.get(nombre)
+        if celda_a is None or celda_b is None:
+            # El nombre es una referencia a otro blob: se comparte en lectura.
+            continue
+        celda = _celda_compartida(a, b, nombre)
+        a.storage[nombre] = celda
+        b.storage[nombre] = celda
+        result.storage[nombre] = celda
+    if comunes:
+        result.inherit(a, exclude=frozenset(a.declared_names() - comunes))
     # La zona compartida vive dentro del área de los dos blobs.
     a.add_child(result)
     b.add_child(result)
@@ -301,7 +396,6 @@ def symmetric_difference(a: Blob, b: Blob, name: Optional[str] = None) -> Blob:
     result.inherit(a, exclude=frozenset(b_names))
     result.inherit(b, exclude=frozenset(a_names))
     result.reference(a.name, a)
-    result.reference(b.name, b)
     return result
 
 

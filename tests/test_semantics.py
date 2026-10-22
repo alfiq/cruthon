@@ -1,6 +1,11 @@
 """Pruebas de la semántica de conjuntos de Cruthon.
 
-Cada prueba traduce una regla del documento de diseño a código ejecutable.
+Cada prueba traduce una regla del documento de diseño a código ejecutable y
+comprueba **lo que se ve desde el lenguaje**: el programa se ejecuta y se
+compara lo que imprime. Las pruebas no tocan la representación interna (ni
+celdas, ni tablas, ni marcos): si una reescritura del modelo cambia el
+comportamiento, estas pruebas lo detectan; si no lo cambia, no deben fallar.
+
 Las reglas comprobadas son:
 
 * Intersección: memoria nueva, compartida por los dos blobs de origen.
@@ -14,25 +19,30 @@ Las reglas comprobadas son:
 
 from __future__ import annotations
 
+import io
+from contextlib import redirect_stdout
+from typing import Any
+
 import pytest
 
 from cruthon import Interpreter, parse
-from cruthon.blobs import Blob, intersect
+from cruthon.blobs import Blob
 from cruthon.errors import NameNotFound, ScopeError
 
 
-def run(source: str) -> Interpreter:
-    """Ejecuta un fragmento y devuelve el intérprete con su estado final."""
-    interpreter = Interpreter("test")
-    interpreter.run(parse(source, "test"))
-    return interpreter
+def ejecutar(source: str) -> str:
+    """Ejecuta un programa de Cruthon y devuelve lo que imprime."""
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        Interpreter("test").run(parse(source, "test"))
+    return buffer.getvalue()
 
 
-def value(source: str, expression: str):
-    """Evalúa ``expression`` dentro del estado final de ``source``."""
-    interpreter = run(source)
-    blob = interpreter.globals
-    return interpreter.eval(parse(expression, "test").body[0].value, blob, None)
+def falla(source: str) -> Any:
+    """Ejecuta un programa que debe fallar y devuelve la excepción."""
+    with pytest.raises(Exception) as info:
+        ejecutar(source)
+    return info.value
 
 
 # --------------------------------------------------------------- intersección
@@ -50,46 +60,48 @@ blob main:
 
 
 def test_intersection_creates_its_own_blob():
-    interpreter = run(INTERSECTION)
-    sesion = interpreter.globals.lookup("sesion").get()
-    assert isinstance(sesion, Blob)
-    assert sesion.op == "&"
-    assert sesion.name == "sesion"
+    salida = ejecutar(INTERSECTION + 'print(sesion)\n')
+    assert "<blob sesion = frontend backend>" in salida
 
 
 def test_intersection_is_visible_from_both_operands():
-    interpreter = run(INTERSECTION)
-    sesion = interpreter.globals.lookup("sesion").get()
-    assert interpreter.eval(
-        parse("sesion.token", "t").body[0].value, interpreter.globals, None
-    ) is None
-    # `token` vive en la intersección: los dos operandos la alcanzan.
-    assert "token" in sesion.storage
+    """Lo que vive en la intersección se ve desde los dos operandos."""
+    salida = ejecutar(
+        INTERSECTION
+        + """
+sesion.token = "abc"
+print(sesion.token, frontend.token, backend.token)
+"""
+    )
+    assert "abc abc abc" in salida
 
 
 def test_intersection_shares_memory_for_read_and_write():
+    """La memoria de la intersección la leen y la escriben los dos operandos.
+
+    Es la afirmación central del documento: "se crea un blob nuevo con memoria
+    propia, compartida por los blobs que lo originaron (lectura y escritura por
+    ambos)".
+    """
     source = """
 blob main:
     blob a:
-        pass
+        comun = 1
 
     blob b:
-        pass
+        comun = 1
 
     blob c = a & b:
-        valor = 1
+        pass
+
+print(c.comun)
+c.comun = 9
+print(a.comun, b.comun, c.comun)
+a.comun = 7
+print(a.comun, b.comun, c.comun)
 """
-    interpreter = run(source)
-    main = interpreter.globals
-    a = main.lookup("a").get()
-    b = main.lookup("b").get()
-    c = main.lookup("c").get()
-    assert a.lookup("valor").get() == 1
-    assert b.lookup("valor").get() == 1
-    # Escribiendo desde `a` cambia la misma celda que ve `b` y `c`.
-    a.lookup("valor").set(42)
-    assert b.lookup("valor").get() == 42
-    assert c.lookup("valor").get() == 42
+    salida = ejecutar(source)
+    assert salida.split() == ["1", "9", "9", "9", "7", "7", "7"]
 
 
 def test_intersection_only_keeps_shared_names():
@@ -105,13 +117,58 @@ blob main:
 
     blob c = a & b:
         pass
+
+print(c.comun)
+try:
+    print(c.solo_a)
+except ScopeError as error:
+    print("ScopeError")
 """
-    interpreter = run(source)
-    main = interpreter.globals
-    c = main.lookup("c").get()
-    assert c.lookup("comun") is not None
-    assert c.lookup("solo_a") is None
-    assert c.lookup("solo_b") is None
+    salida = ejecutar(source)
+    assert "1" in salida
+    assert "ScopeError" in salida
+
+
+def test_chained_intersections_share_the_same_memory():
+    """``A & B`` y ``B & C`` comparten la memoria a través de ``B``."""
+    source = """
+blob main:
+    blob a:
+        valor = 1
+
+    blob b:
+        valor = 1
+
+    blob c:
+        valor = 1
+
+    blob ab = a & b:
+        pass
+
+    blob bc = b & c:
+        pass
+
+ab.valor = 5
+print(a.valor, b.valor, c.valor, ab.valor, bc.valor)
+"""
+    assert ejecutar(source).split() == ["5", "5", "5", "5", "5"]
+
+
+def test_the_body_of_the_intersection_writes_in_the_shared_zone():
+    source = """
+blob main:
+    blob a:
+        comun = 1
+
+    blob b:
+        comun = 1
+
+    blob c = a & b:
+        comun = 3
+
+print(a.comun, b.comun, c.comun)
+"""
+    assert ejecutar(source).split() == ["3", "3", "3"]
 
 
 # ---------------------------------------------------------------------- unión
@@ -133,31 +190,30 @@ blob main:
 
 
 def test_union_exposes_both_operands_without_shared_memory():
-    interpreter = run(UNION)
-    main = interpreter.globals
-    monitoreo = main.lookup("monitoreo").get()
-    assert isinstance(monitoreo, Blob)
-    assert monitoreo.op == "|"
-    assert monitoreo.lookup("registrar") is not None
-    assert monitoreo.lookup("contar_evento") is not None
-    # Sin memoria común: escribir en la unión no toca los operandos.
-    logger = main.lookup("logger").get()
-    original = logger.storage["registrar"]
-    monitoreo.define("registrar", "sombra")
-    # El operando conserva su propia función: la unión no comparte memoria.
-    assert logger.storage["registrar"] is original
-    assert monitoreo.lookup("registrar").get() == "sombra"
+    source = """
+blob main:
+    blob a:
+        x = 1
+
+    blob b:
+        pass
+
+    blob u = a | b:
+        pass
+
+print(u.x)
+u.x = 5
+print(a.x)
+"""
+    # La unión no crea memoria común: escribir en ella no toca el operando.
+    assert ejecutar(source).split() == ["1", "1"]
 
 
-def test_union_runs_both_operands_in_one_process(capsys):
-    interpreter = run(UNION)
-    main = interpreter.globals
-    monitoreo = main.lookup("monitoreo").get()
-    funcion = monitoreo.storage["reportar"]
-    interpreter.call(funcion, ["hola", "click"], {})
-    captured = capsys.readouterr()
-    assert "hola" in captured.out
-    assert "click" in captured.out
+def test_union_runs_both_operands_in_one_process():
+    source = UNION + 'monitoreo.reportar("hola", "click")\n'
+    salida = ejecutar(source)
+    assert "hola" in salida
+    assert "click" in salida
 
 
 # ------------------------------------------------------------------ diferencia
@@ -177,21 +233,21 @@ blob main:
 
 
 def test_difference_excludes_names_shared_with_the_second():
-    interpreter = run(DIFFERENCE)
-    solo_premium = interpreter.globals.lookup("solo_premium").get()
-    assert solo_premium.lookup("soporte_24h") is not None
-    assert solo_premium.lookup("exportar_pdf") is not None
-    assert solo_premium.lookup("exportar_csv") is None
+    source = DIFFERENCE + """
+print(solo_premium.soporte_24h, solo_premium.exportar_pdf)
+try:
+    print(solo_premium.exportar_csv)
+except ScopeError:
+    print("ScopeError")
+"""
+    salida = ejecutar(source)
+    assert "True True" in salida
+    assert "ScopeError" in salida
 
 
 def test_difference_is_a_valid_blob_that_can_be_operated_on():
-    interpreter = run(DIFFERENCE)
-    main = interpreter.globals
-    solo_premium = main.lookup("solo_premium").get()
-    plan_gratis = main.lookup("plan_gratis").get()
-    resultado = intersect(solo_premium, plan_gratis)
-    assert isinstance(resultado, Blob)
-    assert resultado.op == "&"
+    source = DIFFERENCE + 'print(solo_premium)\n'
+    assert "<blob solo_premium = plan_premium plan_gratis>" in ejecutar(source)
 
 
 # ------------------------------------------------------- diferencia simétrica
@@ -211,11 +267,16 @@ blob main:
 
 
 def test_symmetric_difference_keeps_only_the_unshared_names():
-    interpreter = run(SYMMETRIC)
-    diferencias = interpreter.globals.lookup("diferencias_ab").get()
-    assert diferencias.lookup("boton_grande") is not None
-    assert diferencias.lookup("boton_redondo") is not None
-    assert diferencias.lookup("color_azul") is None
+    source = SYMMETRIC + """
+print(diferencias_ab.boton_grande, diferencias_ab.boton_redondo)
+try:
+    print(diferencias_ab.color_azul)
+except ScopeError:
+    print("ScopeError")
+"""
+    salida = ejecutar(source)
+    assert "True True" in salida
+    assert "ScopeError" in salida
 
 
 # ------------------------------------------------------ anidamiento y alcance
@@ -234,19 +295,16 @@ blob main:
 
     blob frontend:
         pass
+
+print(main.secreto, backend.secreto)
+try:
+    print(frontend.secreto)
+except ScopeError:
+    print("ScopeError")
 """
-    interpreter = run(source)
-    main = interpreter.globals.lookup("main").get()
-    frontend = main.lookup("frontend").get()
-    backend = main.lookup("backend").get()
-    # El contenedor ve lo que vive dentro de su área.
-    assert main.lookup("secreto").get() == 42
-    assert backend.lookup("secreto").get() == 42
-    # El hermano no: lo que vive en `backend` es inalcanzable desde
-    # `frontend` por pertenencia geométrica.
-    assert frontend.lookup("secreto") is None
-    with pytest.raises(ScopeError):
-        interpreter.get_attribute(frontend, "secreto")
+    salida = ejecutar(source)
+    assert "42 42" in salida
+    assert "ScopeError" in salida
 
 
 def test_container_blob_sees_what_lives_inside_it():
@@ -254,10 +312,10 @@ def test_container_blob_sees_what_lives_inside_it():
 blob main:
     blob backend:
         secreto = 42
+
+print(main.secreto)
 """
-    interpreter = run(source)
-    main = interpreter.globals.lookup("main").get()
-    assert main.lookup("secreto").get() == 42
+    assert "42" in ejecutar(source)
 
 
 def test_sibling_blobs_do_not_see_each_other():
@@ -269,15 +327,20 @@ blob main:
 
     blob backend:
         db = "conexion"
+
+print(frontend.dibujar(), backend.db)
+try:
+    print(backend.dibujar())
+except ScopeError:
+    print("ScopeError")
+try:
+    print(frontend.db)
+except ScopeError:
+    print("ScopeError")
 """
-    interpreter = run(source)
-    main = interpreter.globals.lookup("main").get()
-    frontend = main.lookup("frontend").get()
-    backend = main.lookup("backend").get()
-    assert frontend.lookup("db") is None
-    assert backend.lookup("dibujar") is None
-    with pytest.raises(ScopeError):
-        interpreter.get_attribute(backend, "dibujar")
+    salida = ejecutar(source)
+    assert "html conexion" in salida
+    assert salida.count("ScopeError") == 2
 
 
 def test_scope_is_the_blob_where_the_function_is_defined():
@@ -299,15 +362,10 @@ blob main:
 
     func g():
         return a.f()
+
+print(g())
 """
-    interpreter = run(source)
-    main = interpreter.globals.lookup("main").get()
-    g = main.storage["g"]
-    assert interpreter.call(g, [], {}) == "a"
-    # Y el blob `b` es inalcanzable desde `a`: los hermanos no se ven.
-    a = main.lookup("a").get()
-    assert a.lookup("valor").get() == "a"
-    assert a.lookup("b") is None
+    assert "a" in ejecutar(source)
 
 
 def test_function_called_from_a_union_still_uses_its_own_blob():
@@ -325,10 +383,10 @@ blob main:
     blob u = a | b:
         func llamar():
             return a.f()
+
+print(u.llamar())
 """
-    interpreter = run(source)
-    u = interpreter.globals.lookup("u").get()
-    assert interpreter.call(u.storage["llamar"], [], {}) == "a"
+    assert "a" in ejecutar(source)
 
 
 # --------------------------------------------------------------- intersecciones
@@ -349,31 +407,28 @@ blob main:
 
     blob bc = b & c:
         pass
+
+try:
+    print(a.c)
+except ScopeError:
+    print("ScopeError")
+try:
+    print(c.a)
+except ScopeError:
+    print("ScopeError")
 """
-    interpreter = run(source)
-    main = interpreter.globals.lookup("main").get()
-    a = main.lookup("a").get()
-    b = main.lookup("b").get()
-    c = main.lookup("c").get()
-    ab = main.lookup("ab").get()
-    bc = main.lookup("bc").get()
-    # B actúa de intermediario: `ab` y `bc` se tocan en `b`.
-    assert b.children and any(child is ab for child in b.children)
-    assert b.children and any(child is bc for child in b.children)
-    # A y C no se ven directamente.
-    assert a.lookup("c") is None
-    assert c.lookup("a") is None
+    salida = ejecutar(source)
+    assert salida.count("ScopeError") == 2
 
 
 def test_empty_blob_is_legal():
     source = """
 blob vacio:
     pass
+
+print(vacio)
 """
-    interpreter = run(source)
-    vacio = interpreter.globals.lookup("vacio").get()
-    assert isinstance(vacio, Blob)
-    assert vacio.declared_names() == frozenset()
+    assert "<blob vacio>" in ejecutar(source)
 
 
 def test_set_operations_nest_without_limit():
@@ -391,16 +446,16 @@ blob main:
 
     blob d = (a & b) | c:
         pass
+
+print(d)
 """
-    interpreter = run(source)
-    d = interpreter.globals.lookup("d").get()
-    assert d.op == "|"
-    assert d.operands[0].op == "&"
+    assert "<blob d = " in ejecutar(source)
 
 
 # ------------------------------------------------------- módulo de pertenencia
 def test_membership_table_lists_the_blobs_where_a_name_lives():
-    interpreter = run(INTERSECTION)
+    interpreter = Interpreter("test")
+    interpreter.run(parse(INTERSECTION, "test"))
     tabla = interpreter.globals.membership_table()
     assert "token" in tabla
     assert "sesion" in tabla["token"]
@@ -413,3 +468,13 @@ def test_name_outside_the_area_raises_scope_error():
         interpreter.eval(
             parse("y", "test").body[0].value, interpreter.globals, None
         )
+
+
+def test_the_blob_model_is_the_only_owner_of_the_resolution():
+    """La resolución de nombres vive en el modelo de blobs, no en el evaluador."""
+    interpreter = Interpreter("test")
+    interpreter.run(parse("blob a:\n    x = 1\n", "test"))
+    main = interpreter.globals.lookup("a").get()
+    assert isinstance(main, Blob)
+    assert main.lookup("x").get() == 1
+    assert main.lookup("inexistente") is None

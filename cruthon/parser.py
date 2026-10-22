@@ -15,7 +15,7 @@ from typing import Any, List, Optional
 
 from . import nodes as N
 from .errors import CruthonSyntaxError, IncompleteInput
-from .lexer import Token, TokenType, tokenize
+from .lexer import Token, TokenType, decode_escapes, tokenize
 
 #: Operadores de asignación aumentada.
 AUG_ASSIGN_OPS = {
@@ -110,6 +110,9 @@ class Parser:
     # -- sentencias ----------------------------------------------------
     def parse_statement(self) -> List[Any]:
         token = self.peek()
+        if token.type is TokenType.OP and token.value == "@":
+            # Un decorador precede siempre a una ``def`` o a una ``class``.
+            return [self.parse_decorated()]
         if token.type is TokenType.NAME:
             keyword = token.value
             if keyword == "blob":
@@ -124,6 +127,10 @@ class Parser:
                 return [self.parse_for()]
             if keyword == "try":
                 return [self.parse_try()]
+            if keyword == "class":
+                return [self.parse_class_def()]
+            if keyword == "with":
+                return [self.parse_with()]
         return self.parse_simple_statement()
 
     def parse_simple_statement(self) -> List[Any]:
@@ -156,9 +163,9 @@ class Parser:
                 return self.parse_from_import()
             if keyword == "del":
                 self.advance()
-                targets = [self.parse_target()]
+                targets = [self.parse_del_target()]
                 while self.accept(TokenType.OP, ","):
-                    targets.append(self.parse_target())
+                    targets.append(self.parse_del_target())
                 return N.Delete(targets=targets, lineno=token.lineno)
             if keyword == "global":
                 self.advance()
@@ -179,8 +186,22 @@ class Parser:
                 if self.accept(TokenType.OP, ","):
                     msg = self.parse_test()
                 return N.Assert(test=test, msg=msg, lineno=token.lineno)
+            if keyword == "raise":
+                self.advance()
+                exc = None
+                cause = None
+                if not self.at(TokenType.NEWLINE) and not self.at(TokenType.ENDMARKER):
+                    exc = self.parse_test()
+                    if self.at_keyword("from"):
+                        self.advance()
+                        cause = self.parse_test()
+                return N.Raise(exc=exc, cause=cause, lineno=token.lineno)
 
         expr = self.parse_expr_list()
+        if isinstance(expr, N.NamedExpr):
+            # En Python, ``(x := 1)`` sólo vale como expresión: como
+            # sentencia es un error de sintaxis.
+            raise self.error("no se puede usar una expresión de asignación como sentencia")
         if self.at(TokenType.OP, "="):
             targets = [self.to_target(expr)]
             while self.accept(TokenType.OP, ","):
@@ -269,6 +290,76 @@ class Parser:
         body = self.parse_block()
         return N.FuncDef(name=name, args=args, body=body, lineno=token.lineno)
 
+    def parse_decorated(self) -> Any:
+        """Parsea ``@decorador`` seguido de la ``def`` o ``class`` que decora.
+
+        Igual que en CPython, cada decorador va en su propia línea y se aplican
+        de abajo hacia arriba: ``@a @b`` es ``a(b(objeto))``.
+        """
+        decorators: List[Any] = []
+        while self.at(TokenType.OP, "@"):
+            self.advance()
+            decorators.append(self.parse_test())
+            self.expect(TokenType.NEWLINE)
+        token = self.peek()
+        if token.type is TokenType.NAME and token.value in ("func", "def"):
+            node = self.parse_func_def()
+        elif token.type is TokenType.NAME and token.value == "class":
+            node = self.parse_class_def()
+        else:
+            # Puede que la entrada esté incompleta (la REPL pide otra línea).
+            raise IncompleteInput(
+                "un decorador debe precede a una 'def' o a una 'class'",
+                self.filename,
+                token.lineno,
+            )
+        node.decorators = decorators
+        return node
+
+    def parse_class_def(self) -> N.ClassDef:
+        """Parsea ``class Nombre(Base1, Base2):``."""
+        token = self.expect(TokenType.NAME, "class")
+        name = self.expect(TokenType.NAME).value
+        bases: List[Any] = []
+        if self.accept(TokenType.OP, "("):
+            while not self.at(TokenType.OP, ")"):
+                bases.append(self.parse_test())
+                if not self.accept(TokenType.OP, ","):
+                    break
+            self.expect(TokenType.OP, ")")
+        self.expect(TokenType.OP, ":")
+        body = self.parse_block()
+        return N.ClassDef(name=name, bases=bases, body=body, lineno=token.lineno)
+
+    def parse_with(self) -> N.With:
+        """Parsea ``with expr as nombre, expr2 as nombre2:``."""
+        token = self.expect(TokenType.NAME, "with")
+        items: List[N.WithItem] = []
+        while True:
+            context = self.parse_test()
+            optional_vars = None
+            if self.at_keyword("as"):
+                self.advance()
+                optional_vars = self.parse_with_target()
+            items.append(N.WithItem(context_expr=context, optional_vars=optional_vars))
+            if not self.accept(TokenType.OP, ","):
+                break
+        self.expect(TokenType.OP, ":")
+        body = self.parse_block()
+        return N.With(items=items, body=body, lineno=token.lineno)
+
+    def parse_with_target(self) -> Any:
+        """Destino de un ``as``: un solo nombre, o una tupla entre paréntesis.
+
+        No puede ser una lista de destinos sin paréntesis: en
+        ``with a() as x, b() as y:`` la coma separa los gestores de contexto,
+        no los destinos. Como en Python, una tupla de destinos se escribe con
+        paréntesis: ``with a() as (x, y):``.
+        """
+        if self.at(TokenType.OP, "(") or self.at(TokenType.OP, "["):
+            return self.to_target(self.parse_target_list())
+        return self.parse_target_element()
+
     def parse_arguments(self) -> N.Arguments:
         self.expect(TokenType.OP, "(")
         args: List[N.Arg] = []
@@ -277,26 +368,33 @@ class Parser:
         vararg: Optional[str] = None
         kwarg: Optional[str] = None
         seen_default = False
+        solo_palabra_clave = False
         while not self.at(TokenType.OP, ")"):
             if self.accept(TokenType.OP, "**"):
                 kwarg = self.expect(TokenType.NAME).value
-            elif self.accept(TokenType.OP, "*"):
-                vararg = self.expect(TokenType.NAME).value
+            elif self.at(TokenType.OP, "*"):
+                self.advance()
+                if self.at(TokenType.NAME):
+                    # ``*args``: argumentos posicionales extra.
+                    vararg = self.expect(TokenType.NAME).value
+                else:
+                    # ``*`` a secas: lo que sigue es sólo por palabra clave.
+                    solo_palabra_clave = True
             else:
                 arg_name = self.expect(TokenType.NAME).value
                 default = None
                 if self.accept(TokenType.OP, "="):
                     default = self.parse_test()
                     seen_default = True
-                else:
-                    if seen_default:
-                        raise self.error("argumento sin valor por defecto tras otro con valor")
+                elif seen_default and not solo_palabra_clave:
+                    raise self.error("argumento sin valor por defecto tras otro con valor")
                 arg = N.Arg(name=arg_name, default=default)
-                if default is None:
-                    args.append(arg)
+                if solo_palabra_clave:
+                    kwonly.append(arg)
                 else:
                     args.append(arg)
-                    defaults.append(default)
+                    if default is not None:
+                        defaults.append(default)
             if not self.accept(TokenType.OP, ","):
                 break
         self.expect(TokenType.OP, ")")
@@ -417,14 +515,34 @@ class Parser:
         while self.accept(TokenType.OP, ","):
             if self.at(TokenType.NEWLINE) or self.at(TokenType.ENDMARKER):
                 break
-            elements.append(self.parse_test())
+            elements.append(self.parse_star_or_test())
         return N.Tuple(elts=elements, lineno=first.lineno)
+
+    def parse_star_or_test(self) -> Any:
+        """Un elemento de tupla que puede ser ``*resto``.
+
+        Sólo tiene sentido como destino (``a, *b = ...``); en una expresión
+        el evaluador lo rechaza, igual que hace Python al desempaquetar.
+        """
+        if self.at(TokenType.OP, "*"):
+            self.advance()
+            return N.Starred(value=self.parse_test())
+        return self.parse_test()
 
     def parse_test(self) -> Any:
         """Expresión condicional ``a if cond else b``."""
         if self.at_keyword("lambda"):
             return self.parse_lambda()
+        if self.at_keyword("yield"):
+            return self.parse_yield()
         body = self.parse_or_test()
+        if self.at(TokenType.OP, ":="):
+            # Expresión de asignación: ``(x := valor)``.
+            self.advance()
+            if not isinstance(body, N.Name):
+                raise self.error("el destino de ':=' debe ser un nombre")
+            value = self.parse_test()
+            return N.NamedExpr(target=body, value=value, lineno=body.lineno)
         if self.at_keyword("if"):
             self.advance()
             test = self.parse_or_test()
@@ -432,6 +550,26 @@ class Parser:
             orelse = self.parse_test()
             return N.IfExp(test=test, body=body, orelse=orelse, lineno=body.lineno)
         return body
+
+    def parse_yield(self) -> N.Yield:
+        """Parsea ``yield``, ``yield valor`` y ``yield from iterable``."""
+        token = self.expect(TokenType.NAME, "yield")
+        if self.at_keyword("from"):
+            self.advance()
+            value = self.parse_test()
+            return N.Yield(value=value, delegate=True, lineno=token.lineno)
+        if (
+            self.at(TokenType.NEWLINE)
+            or self.at(TokenType.ENDMARKER)
+            or self.at(TokenType.OP, ")")
+            or self.at(TokenType.OP, "]")
+            or self.at(TokenType.OP, "}")
+            or self.at(TokenType.OP, ",")
+            or self.at(TokenType.OP, ";")
+        ):
+            return N.Yield(value=None, lineno=token.lineno)
+        value = self.parse_expr_list()
+        return N.Yield(value=value, lineno=token.lineno)
 
     def parse_lambda(self) -> N.Lambda:
         token = self.expect(TokenType.NAME, "lambda")
@@ -578,8 +716,20 @@ class Parser:
                 self.advance()
                 args: List[Any] = []
                 keywords: List[N.Keyword] = []
+                primero = True
                 while not self.at(TokenType.OP, ")"):
-                    if (
+                    if self.at(TokenType.OP, "**"):
+                        # ``f(**d)``: expands a mapping into keyword arguments.
+                        self.advance()
+                        keywords.append(
+                            N.Keyword(arg=None, value=self.parse_test(), lineno=node.lineno)
+                        )
+                    elif self.at(TokenType.OP, "*"):
+                        # ``f(*seq)``: expands a sequence into positional
+                        # arguments.
+                        self.advance()
+                        args.append(N.Starred(value=self.parse_test(), lineno=node.lineno))
+                    elif (
                         self.peek().type is TokenType.NAME
                         and self.peek().value not in ("not", "lambda")
                         and self.peek(1).type is TokenType.OP
@@ -592,6 +742,26 @@ class Parser:
                         )
                     else:
                         args.append(self.parse_test())
+                    if primero and self.at_keyword("for"):
+                        # ``f(x for x in xs)``: expresión generadora. En Python
+                        # sólo puede ser el único argumento de la llamada.
+                        if len(args) != 1 or keywords:
+                            raise self.error(
+                                "una expresión generadora sólo puede ser el "
+                                "único argumento de una llamada"
+                            )
+                        generadores = self.parse_comprehensions()
+                        args = [
+                            N.GeneratorExp(
+                                elt=args[0], generators=generadores, lineno=node.lineno
+                            )
+                        ]
+                        primero = False
+                        # Tras la expresión generadora sólo puede venir el
+                        # cierre de la llamada: ``f(x for x in xs, 2)`` es un
+                        # error de sintaxis, como en Python.
+                        break
+                    primero = False
                     if not self.accept(TokenType.OP, ","):
                         break
                 self.expect(TokenType.OP, ")")
@@ -660,13 +830,13 @@ class Parser:
             if self.at(TokenType.OP, ")"):
                 self.advance()
                 return N.Tuple(elts=[], lineno=token.lineno)
-            first = self.parse_test()
+            first = self.parse_star_or_test()
             if self.at(TokenType.OP, ","):
                 elements = [first]
                 while self.accept(TokenType.OP, ","):
                     if self.at(TokenType.OP, ")"):
                         break
-                    elements.append(self.parse_test())
+                    elements.append(self.parse_star_or_test())
                 self.expect(TokenType.OP, ")")
                 return N.Tuple(elts=elements, lineno=token.lineno)
             self.expect(TokenType.OP, ")")
@@ -682,8 +852,10 @@ class Parser:
         if self.at(TokenType.OP, "]"):
             self.advance()
             return N.List(elts=[], lineno=token.lineno)
-        first = self.parse_test()
+        first = self.parse_star_or_test()
         if self.at_keyword("for"):
+            if isinstance(first, N.Starred):
+                raise self.error("no se puede usar '*' en una comprensión")
             generators = self.parse_comprehensions()
             self.expect(TokenType.OP, "]")
             return N.ListComp(elt=first, generators=generators, lineno=token.lineno)
@@ -691,7 +863,7 @@ class Parser:
         while self.accept(TokenType.OP, ","):
             if self.at(TokenType.OP, "]"):
                 break
-            elements.append(self.parse_test())
+            elements.append(self.parse_star_or_test())
         self.expect(TokenType.OP, "]")
         return N.List(elts=elements, lineno=token.lineno)
 
@@ -700,8 +872,13 @@ class Parser:
         if self.at(TokenType.OP, "}"):
             self.advance()
             return N.Dict(keys=[], values=[], lineno=token.lineno)
-        first = self.parse_test()
+        if self.at(TokenType.OP, "**"):
+            # ``{**otro, 'b': 2}``: un diccionario con expansión.
+            return self.parse_dict_with_unpacking(token)
+        first = self.parse_star_or_test()
         if self.at(TokenType.OP, ":"):
+            if isinstance(first, N.Starred):
+                raise self.error("no se puede mezclar '*' con pares clave-valor")
             self.advance()
             value = self.parse_test()
             if self.at_keyword("for"):
@@ -720,6 +897,8 @@ class Parser:
             self.expect(TokenType.OP, "}")
             return N.Dict(keys=keys, values=values, lineno=token.lineno)
         if self.at_keyword("for"):
+            if isinstance(first, N.Starred):
+                raise self.error("no se puede usar '*' en una comprensión")
             generators = self.parse_comprehensions()
             self.expect(TokenType.OP, "}")
             return N.SetComp(elt=first, generators=generators, lineno=token.lineno)
@@ -727,9 +906,35 @@ class Parser:
         while self.accept(TokenType.OP, ","):
             if self.at(TokenType.OP, "}"):
                 break
-            elements.append(self.parse_test())
+            elements.append(self.parse_star_or_test())
         self.expect(TokenType.OP, "}")
         return N.Set(elts=elements, lineno=token.lineno)
+
+    def parse_dict_with_unpacking(self, token: Token) -> Any:
+        """Parsea ``{**a, 'b': 1}``.
+
+        Las expansiones se guardan como claves ``N.Starred``: el evaluador
+        las distingue de una clave normal y actualiza el diccionario con
+        ellas, como hace Python.
+        """
+        keys: List[Any] = []
+        values: List[Any] = []
+        while True:
+            if self.at(TokenType.OP, "**"):
+                self.advance()
+                keys.append(N.Starred(value=self.parse_test(), lineno=token.lineno))
+                values.append(None)
+            else:
+                key = self.parse_test()
+                self.expect(TokenType.OP, ":")
+                keys.append(key)
+                values.append(self.parse_test())
+            if not self.accept(TokenType.OP, ","):
+                break
+            if self.at(TokenType.OP, "}"):
+                break
+        self.expect(TokenType.OP, "}")
+        return N.Dict(keys=keys, values=values, lineno=token.lineno)
 
     def parse_comprehensions(self) -> List[N.CompGenerator]:
         generators: List[N.CompGenerator] = []
@@ -761,8 +966,12 @@ class Parser:
             expression = sub.parse_test()
             format_spec = None
             if spec:
-                spec_parser = Parser(tokenize(spec, self.filename), self.filename)
-                format_spec = spec_parser.parse_test()
+                # El formato de una f-string es texto literal, como en CPython:
+                # ``f"{x:03d}"`` formatea con la especificación "03d".
+                format_spec = N.Constant(
+                    value=decode_escapes(spec, self.filename, token.lineno),
+                    lineno=token.lineno,
+                )
             values.append(
                 N.FormattedValue(
                     value=expression,
@@ -810,6 +1019,30 @@ class Parser:
             return N.Starred(value=self.parse_target_element())
         token = self.expect(TokenType.NAME)
         return N.Name(id=token.value, lineno=token.lineno)
+
+    def parse_del_target(self) -> Any:
+        """Destino de un ``del``: un nombre, un atributo o un índice.
+
+        Es lo mismo que acepta CPython: ``del x``, ``del obj.attr`` y
+        ``del lista[0]``; lo demás es un error de sintaxis.
+        """
+        node = self.parse_primary()
+        while True:
+            if self.at(TokenType.OP, "["):
+                self.advance()
+                index = self.parse_subscript()
+                self.expect(TokenType.OP, "]")
+                node = N.Subscript(value=node, slice=index, lineno=node.lineno)
+                continue
+            if self.at(TokenType.OP, "."):
+                self.advance()
+                attr = self.expect(TokenType.NAME)
+                node = N.Attribute(value=node, attr=attr.value, lineno=node.lineno)
+                continue
+            break
+        if not isinstance(node, (N.Name, N.Attribute, N.Subscript)):
+            raise self.error("no se puede eliminar esta expresión")
+        return node
 
     def to_target(self, node: Any) -> Any:
         """Convierte una expresión en un destino asignable."""
