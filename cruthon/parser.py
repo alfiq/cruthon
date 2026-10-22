@@ -945,15 +945,8 @@ class Parser:
         if token.type is TokenType.NUMBER:
             self.advance()
             return N.Constant(value=token.value, lineno=token.lineno)
-        if token.type is TokenType.STRING:
-            self.advance()
-            value = token.value
-            while self.at(TokenType.STRING):  # concatenación implícita
-                value += self.advance().value
-            return N.Constant(value=value, lineno=token.lineno)
-        if token.type is TokenType.FSTRING:
-            self.advance()
-            return self.build_joined_string(token)
+        if token.type in (TokenType.STRING, TokenType.FSTRING):
+            return self.parse_string_group()
         if token.type is TokenType.NAME:
             if token.value == "True":
                 self.advance()
@@ -1110,6 +1103,66 @@ class Parser:
                 N.CompGenerator(target=target, iter=iterable, ifs=ifs)
             )
         return generators
+
+    def parse_string_group(self) -> Any:
+        """Literales de cadena adyacentes: una sola expresión, como en Python.
+
+        La concatenación implícita mezcla texto y f-strings en cualquier
+        orden (``f"a" "b"``, ``"a" f"b"``, ``f"a" f"b"``), también cuando
+        los literales caen en líneas distintas dentro de un paréntesis: ahí
+        el léxico ya los entrega seguidos. Los bytes sólo se concatenan con
+        bytes; mezclarlos con texto es error de sintaxis, como en CPython.
+        """
+        primero = self.advance()
+        if primero.type is TokenType.FSTRING:
+            partes: List[Any] = list(self.build_joined_string(primero).values)
+        else:
+            partes = [primero.value]
+        while self.at(TokenType.STRING) or self.at(TokenType.FSTRING):
+            siguiente = self.advance()
+            if siguiente.type is TokenType.FSTRING:
+                partes.extend(self.build_joined_string(siguiente).values)
+            else:
+                partes.append(siguiente.value)
+        return self._une_literales(partes, primero)
+
+    def _une_literales(self, partes: List[Any], primero: Token) -> Any:
+        """Une las partes ya analizadas de un grupo de literales adyacentes.
+
+        Sin f-strings el resultado es una constante (suma de cadenas o de
+        bytes). Con f-strings el resultado es un ``JoinedStr`` cuyas
+        constantes vecinas se funden en una sola, para que ``f"a" "b"`` se
+        evalúe como el texto ``ab`` y no como dos piezas.
+        """
+        hay_bytes = any(isinstance(parte, (bytes, bytearray)) for parte in partes)
+        hay_texto = any(not isinstance(parte, (bytes, bytearray)) for parte in partes)
+        if hay_bytes and hay_texto:
+            raise self.error(
+                "no se pueden mezclar literales de bytes y de texto", primero
+            )
+        if not hay_texto:
+            unido = partes[0]
+            for parte in partes[1:]:
+                unido += parte
+            return N.Constant(value=unido, lineno=primero.lineno)
+        valores: List[Any] = []
+        for parte in partes:
+            if isinstance(parte, str):
+                anterior = valores[-1] if valores else None
+                if (
+                    isinstance(anterior, N.Constant)
+                    and isinstance(anterior.value, str)
+                ):
+                    anterior.value += parte
+                else:
+                    valores.append(N.Constant(value=parte, lineno=primero.lineno))
+            else:
+                valores.append(parte)
+        if not valores:
+            return N.Constant(value="", lineno=primero.lineno)
+        if len(valores) == 1 and isinstance(valores[0], N.Constant):
+            return valores[0]
+        return N.JoinedStr(values=valores, lineno=primero.lineno)
 
     def build_joined_string(self, token: Token) -> N.JoinedStr:
         """Construye el nodo ``JoinedStr`` de una f-string."""

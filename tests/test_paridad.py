@@ -35,6 +35,21 @@ PARIDAD = [
     pytest.param("print('\\u00e9\\N{LATIN SMALL LETTER E WITH ACUTE}')", id="escape-unicode"),
     pytest.param("print('it\\'s')", id="comilla-simple-escapada"),
     pytest.param("print('a' 'b')", id="concatenacion-implicita"),
+    pytest.param("print('a' 'b' 'c')", id="concatenacion-de-tres-literal"),
+    pytest.param("print(f'a' f'b')", id="concatenacion-de-fstrings"),
+    pytest.param("print('a' f'b')", id="concatenacion-texto-y-fstring"),
+    pytest.param("print(f'a' 'b')", id="concatenacion-fstring-y-texto"),
+    pytest.param("n = 2\nprint(f'a{n}' 'b' f'{n}')", id="concatenacion-con-campos"),
+    pytest.param("print(b'a' b'b')", id="concatenacion-de-bytes"),
+    pytest.param("print(r'a\\n' 'b')", id="concatenacion-con-raw"),
+    pytest.param(
+        "n = 1\nx = (\n    'a'\n  f'b{n}'\n      'c'\n)\nprint(x)",
+        id="concatenacion-en-lineas-distintas-entre-parentesis",
+    ),
+    pytest.param(
+        "print('a'\n      'b')",
+        id="concatenacion-con-sangria-irregular-entre-parentesis",
+    ),
     pytest.param("print(1 + 2 * 3 ** 2)", id="precedencia-aritmetica"),
     pytest.param("x = 5\nprint(x if x > 3 else 'no')", id="ternario"),
     pytest.param("print([i * 2 for i in range(3)])", id="comprension-de-lista"),
@@ -1032,6 +1047,29 @@ def test_dos_destinos_con_estrella_en_el_mismo_nivel_son_error_de_sintaxis(sourc
 )
 def test_el_yield_fuera_de_una_funcion_es_error_de_sintaxis(source: str):
     """Como en Python, un ``yield`` fuera de una función no se analiza."""
+    en_cruthon = _cruthon(source)
+    en_python = _cpython(source)
+    assert en_python.returncode != 0
+    assert en_cruthon.returncode != 0
+    assert "SyntaxError" in en_cruthon.stderr
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("print('a' x)", id="literal-junto-a-un-nombre"),
+        pytest.param("print('a' 1)", id="literal-junto-a-un-numero"),
+        pytest.param("print('a' b'b')", id="texto-junto-a-bytes"),
+        pytest.param("print(f'a' b'b')", id="fstring-junto-a-bytes"),
+    ],
+)
+def test_un_literal_junto_a_otra_cosa_no_se_concatena(source: str):
+    """La concatenación implícita es sólo entre literales de cadena.
+
+    Un literal seguido de un nombre, de un número o de bytes sigue siendo
+    error de sintaxis: la regla nueva no convierte en expresión cualquier
+    cosa que venga después.
+    """
     en_cruthon = _cruthon(source)
     en_python = _cpython(source)
     assert en_python.returncode != 0

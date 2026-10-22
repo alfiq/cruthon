@@ -256,6 +256,10 @@ una clase y una clase no es un blob.
   línea (`DuplicateName`), no donde después se usa el nombre. Una
   región, en cambio, es única por su ruta de inclusión: `main.A.API` y
   `main.B.API` son cosas distintas aunque las dos se llamen `API`.
+* **El vocabulario.** Pertenencia (`∈`) e inclusión (`⊆`) no son sinónimos, y
+  una región se identifica por su ruta. El glosario fija los términos y las
+  palabras que no se usan para hablar de esto (genealogía, padre/hijo,
+  herencia, namespace): [`docs/glosario.md`](docs/glosario.md).
 * **Los cuatro operadores.** `&`, `|`, `-` y `^` entre dos *blobs* ejecutan
   operaciones de conjuntos. Entre cualquier otro valor son los operadores
   bit a bit de Python, sin cambios.
@@ -280,8 +284,10 @@ una clase y una clase no es un blob.
 [`tests/test_paridad.py`](tests/test_paridad.py) ejecuta los mismos
 fragmentos en Cruthon y en CPython y compara la salida byte a byte. Cubre
 escapes de cadena, f-strings (con formato, con conversión y con el marcador
-de depuración `f"{x=}"`), comprehensions (y expresiones generadoras),
-`del`, `global`, `nonlocal`, closures, `*args`/`**kwargs`, argumentos por
+de depuración `f"{x=}"`), la concatenación implícita de literales adyacentes
+en cualquier mezcla de texto y f-strings (`f"a" "b"`, `"a" f"b"`, incluso
+entre líneas dentro de un paréntesis), comprehensions (y expresiones
+generadoras), `del`, `global`, `nonlocal`, closures, `*args`/`**kwargs`, argumentos por
 palabra clave, slices, excepciones (`raise`, `except` con tupla, `finally`),
 `import` de la biblioteca estándar, las operaciones aritméticas, los
 literales complejos y `Ellipsis`, la expansión `**` en diccionarios, las
@@ -363,7 +369,7 @@ Las decisiones y las buenas prácticas están en
 ## Pruebas
 
 ```bash
-python -m pytest            # 483 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
+python -m pytest            # 505 pruebas: léxico, sintaxis, semántica, REPL, CLI, paridad, ejemplos, web y PDF
 ```
 
 ## El documento de diseño
@@ -373,7 +379,9 @@ es el documento original (11 páginas). La última página se añadió con
 [`tools/pdf_interpreted_page.py`](tools/pdf_interpreted_page.py) y documenta
 explícitamente que **Cruthon se interpreta como Python y se ejecuta conforme
 se lee**. El texto extraído del PDF está en
-[`docs/especificacion-texto.md`](docs/especificacion-texto.md).
+[`docs/especificacion-texto.md`](docs/especificacion-texto.md); como es una
+extracción automática, el vocabulario de nombres y regiones que no viene del
+PDF vive aparte, en [`docs/glosario.md`](docs/glosario.md).
 
 ## Estado y preguntas abiertas
 

@@ -901,11 +901,20 @@ if (formulario) {
     </section>"""
 
         func pie(estado):
+            # Literales adyacentes, como en Python: la línea larga del pie se
+            # lee en piezas y se evalúa como una sola cadena.
+            contador = (
+                f"<p>Desde {escapar(estado.inicio)} van "
+                f"<span data-operaciones>{estado.operaciones}</span> operaciones. "
+                "<a href=\"/salud\">Estado</a> · "
+                "<a href=\"/api/estado\">API</a> · "
+                "<a href=\"/estatico/hoja.css\">Hoja</a></p>"
+            )
             return f"""
   </main>
   <footer class="pie">
     <p>Servido por Cruthon desde el blob <code>main</code>: <code>transporte | bitacora</code>, con <code>estado = api &amp; sitio</code> como única zona compartida.</p>
-    <p>Desde {escapar(estado.inicio)} van <span data-operaciones>{estado.operaciones}</span> operaciones. <a href="/salud">Estado</a> · <a href="/api/estado">API</a> · <a href="/estatico/hoja.css">Hoja</a></p>
+    {contador}
   </footer>
 </body>
 </html>

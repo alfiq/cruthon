@@ -79,6 +79,13 @@ respuesta HTTP) sale del mismo programa. El guion son 110 líneas de
 JavaScript sin dependencias, y toda la lógica de conjuntos vive en el
 servidor.
 
+Las piezas de HTML que se arman con datos se escriben como literales
+adyacentes, igual que en Python: `pie()` reparte el párrafo del contador en
+cinco literales (tres f-strings y dos de texto) y el intérprete los evalúa
+como una sola cadena. Eso es lo que permite que la línea más larga del
+ejemplo se lea en renglones sin cambiar un byte de la respuesta; la paridad
+está fijada en `tests/test_paridad.py`.
+
 ## Buenas prácticas, y dónde están
 
 **Red y HTTP**
